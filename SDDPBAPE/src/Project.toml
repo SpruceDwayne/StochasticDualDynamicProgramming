@@ -1,0 +1,8 @@
+name = "SDDPBAPE"
+uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"  # use `UUIDs.uuid4()` to generate
+version = "0.1.0"
+
+[deps]
+JuMP = "4076af6c-e467-56ae-b986-b466b2749572"
+HiGHS = "87dc4568-4c63-4d18-b0c0-bb1f24c62d49"   # if you use it in examples or src
+
