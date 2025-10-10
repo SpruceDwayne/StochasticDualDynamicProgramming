@@ -1,138 +1,7 @@
-using JuMP
-using LinearAlgebra   # for dot, norm
-
-"Canonical node type for a scenario tree."
-struct TreeNode{Ω}
-    id::Int
-    parent::Union{Nothing,Int}
-    ω::Ω                    # shock (whatever your build expects)
-    p_cond::Float64         # P(node | parent)  (root typically has p_cond = 1.0)
-end
-
-"Tree grouped by level: levels[t] = nodes at stage t. Children are those with parent==node.id."
-struct ScenarioTree{Ω}
-    levels::Vector{Vector{TreeNode{Ω}}}
-end
-
-"Convenience: unconditional probability of a node is product of p_cond up the path."
-function node_probability(tree::ScenarioTree, t::Int, node_id::Int)
-    # O(depth) walk. Cache this if the tree is big.
-    id = node_id
-    prob = 1.0
-    for s in t:-1:2  # walk back to stage 1
-        node = first(n for n in tree.levels[s] if n.id == id)
-        prob *= node.p_cond
-        id = node.parent::Int
-    end
-    # root
-    prob *= 1.0
-    return prob
-end
+using LinearAlgebra
+using SparseArrays  # if you use SparseMatrixCSC
 
 
-"One full path through the tree."
-struct Trajectory{Ω}
-    node_ids::Vector{Int}   # node_ids[t] is the chosen node at stage t
-    ω::Vector{Ω}            # ω[t] at each stage t
-    p::Float64              # unconditional probability of this path
-end
-
-"Enumerate or sample trajectories."
-
-"Depth-first enumeration (useful for small trees, deterministic)."
-function enumerate_trajectories(tree::ScenarioTree)
-    T = length(tree.levels)
-    results = Trajectory[]
-    buf_nodes = Vector{Int}(undef, T)
-    buf_ω     = Vector{eltype(first(tree.levels)).ω}(undef, T)
-
-    function rec(t::Int, prob::Float64, parent_id::Union{Nothing,Int})
-        if t == 1
-            for n in tree.levels[1]
-                buf_nodes[1] = n.id
-                buf_ω[1] = n.ω
-                rec(2, prob * n.p_cond, n.id)
-            end
-            return
-        end
-        if t > T
-            push!(results, Trajectory(copy(buf_nodes), copy(buf_ω), prob))
-            return
-        end
-        for n in tree.levels[t]
-            if n.parent == parent_id
-                buf_nodes[t] = n.id
-                buf_ω[t] = n.ω
-                rec(t+1, prob * n.p_cond, n.id)
-            end
-        end
-    end
-
-    rec(1, 1.0, nothing)
-    return results
-end
-
-"Random sampling of trajectories according to child conditional probabilities."
-function sample_trajectories(tree::ScenarioTree, n_samples::Int)
-    T = length(tree.levels)
-    out = Vector{Trajectory}(undef, n_samples)
-    for s in 1:n_samples
-        node_ids = Vector{Int}(undef, T)
-        ω        = Vector{eltype(first(tree.levels)).ω}(undef, T)
-        prob = 1.0
-        # pick root
-        roots = tree.levels[1]
-        # Their p_cond should sum to 1 (or you handle otherwise).
-        r = rand()
-        acc = 0.0
-        root = nothing
-        for n in roots
-            acc += n.p_cond
-            if r <= acc
-                root = n; break
-            end
-        end
-        @assert root !== nothing "No root sampled; check p_cond at t=1"
-        node_ids[1] = root.id; ω[1] = root.ω; prob *= root.p_cond
-        parent = root.id
-
-        for t in 2:T
-            children = [n for n in tree.levels[t] if n.parent == parent]
-            r = rand()
-            acc = 0.0
-            chosen = nothing
-            for n in children
-                acc += n.p_cond
-                if r <= acc
-                    chosen = n; break
-                end
-            end
-            @assert chosen !== nothing "No child sampled at t=$t; check p_cond"
-            node_ids[t] = chosen.id
-            ω[t] = chosen.ω
-            prob *= chosen.p_cond
-            parent = chosen.id
-        end
-        out[s] = Trajectory(node_ids, ω, prob)
-    end
-    return out
-end
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#-----------------------------------------------------
 "One affine cut α + β'x tagged with its stage."
 struct Cut{T}
     α::T
@@ -144,7 +13,6 @@ end
 mutable struct ValueFn{T}
     cuts::Vector{Cut{T}}
 end
-
 ValueFn{T}() where {T} = ValueFn{T}(Cut{T}[])
 
 "Evaluate V(x) and pick an active subgradient (β of any maximizer)."
@@ -172,9 +40,173 @@ end
 struct Stage
     t::Int
     state_dim::Int
-    build::Function   # (t, vf_next, ω; fix_state = nothing) -> (model, x_state, theta, misc)
-    sampler::Function # () -> ω  (noise for this stage)
-    ϕ::Function       # (ω) -> probability or weight (risk-neutral → 1/#scenarios)
+    build::Function   # (t, vf_next, ω; fix_state=nothing) -> (model, x_state, θ, misc)
+    sampler::Function # () -> ω
+    weight::Function  # ω -> probability/weight
+end
+
+"Scenario tree + trajectories (optional, if you want deterministic trees/sampling)."
+struct TreeNode{Ω}
+    id::Int
+    parent::Union{Nothing,Int}
+    ω::Ω
+    p_cond::Float64
+end
+struct ScenarioTree{Ω}
+    levels::Vector{Vector{TreeNode{Ω}}}
+end
+struct Trajectory{Ω}
+    node_ids::Vector{Int}
+    ω::Vector{Ω}
+    p::Float64
+end
+
+
+# Keep it simple: only 1 type parameter, and fields typed to AbstractMatrix{T}
+struct BaseStageData{T}
+    A::AbstractMatrix{T}
+    B::AbstractMatrix{T}
+    G::AbstractMatrix{T}
+end
+
+# Converting outer constructor: promotes and converts all matrices to a common eltype T
+function BaseStageData(A::AbstractMatrix, B::AbstractMatrix, G::AbstractMatrix)
+    T = promote_type(eltype(A), eltype(B), eltype(G))
+    return BaseStageData{T}(
+        convert(AbstractMatrix{T}, A),
+        convert(AbstractMatrix{T}, B),
+        convert(AbstractMatrix{T}, G),
+    )
+end
+
+# Scenario payload with the *same single type parameter T*
+struct OmegaRef{T}
+    base::BaseStageData{T}
+    c_u::Vector{T}
+    c_x::Vector{T}
+    d::Vector{T}
+    h::Vector{T}
+end
+
+# Positional converting constructor: promotes all pieces to a common T
+function OmegaRef(base::BaseStageData, c_u::AbstractVector, c_x::AbstractVector,
+                  d::AbstractVector, h::AbstractVector)
+    T = promote_type(eltype(base.A), eltype(c_u), eltype(c_x), eltype(d), eltype(h))
+    baseT = BaseStageData(
+        convert(AbstractMatrix{T}, base.A),
+        convert(AbstractMatrix{T}, base.B),
+        convert(AbstractMatrix{T}, base.G),
+    )
+    return OmegaRef{T}(
+        baseT,
+        convert(Vector{T}, c_u),
+        convert(Vector{T}, c_x),
+        convert(Vector{T}, d),
+        convert(Vector{T}, h),
+    )
+end
+
+# Nice keyword convenience (calls the positional one)
+OmegaRef(; base::BaseStageData, c_u, c_x, d, h) = OmegaRef(base, c_u, c_x, d, h)
+
+
+
+
+
+
+struct OmegaStageData{T}
+    c_u::Vector{T}
+    c_x::Vector{T}
+    A::SparseMatrixCSC{T,Int}
+    B::SparseMatrixCSC{T,Int}
+    d::Vector{T}
+    G::SparseMatrixCSC{T,Int}
+    h::Vector{T}
+end
+
+
+# Enumerate all root→leaf trajectories
+function enumerate_trajectories(tree::ScenarioTree{Ω}) where {Ω}
+    T = length(tree.levels)
+    results = Trajectory{Ω}[]
+    nodebuf = Vector{Int}(undef, T)
+    ωbuf    = Vector{Ω}(undef, T)
+
+    function rec(t::Int, parent_id::Union{Nothing,Int}, p::Float64)
+        if t == 1
+            for n in tree.levels[1]
+                nodebuf[1] = n.id
+                ωbuf[1]    = n.ω
+                rec(2, n.id, p * n.p_cond)
+            end
+            return
+        end
+        if t > T
+            push!(results, Trajectory(copy(nodebuf), copy(ωbuf), p))
+            return
+        end
+        for n in tree.levels[t]
+            if n.parent == parent_id
+                nodebuf[t] = n.id
+                ωbuf[t]    = n.ω
+                rec(t+1, n.id, p * n.p_cond)
+            end
+        end
+    end
+
+    rec(1, nothing, 1.0)
+    return results
+end
+
+# Sample n trajectories IID from the tree distribution
+function sample_trajectories(tree::ScenarioTree{Ω}, n_samples::Int) where {Ω}
+    T   = length(tree.levels)
+    out = Vector{Trajectory{Ω}}(undef, n_samples)
+
+    for s in 1:n_samples
+        node_ids = Vector{Int}(undef, T)
+        ω        = Vector{Ω}(undef, T)
+        p        = 1.0
+
+        # root
+        r = rand(); acc = 0.0
+        root = nothing
+        for n in tree.levels[1]
+            acc += n.p_cond
+            if r <= acc
+                root = n; break
+            end
+        end
+        @assert root !== nothing "root sampling failed (check root p_cond sums to 1)"
+
+        node_ids[1] = root.id
+        ω[1]        = root.ω
+        p          *= root.p_cond
+        parent      = root.id
+
+        # descend
+        for t in 2:T
+            children = (n for n in tree.levels[t] if n.parent == parent)
+            r = rand(); acc = 0.0
+            chosen = nothing
+            for n in children
+                acc += n.p_cond
+                if r <= acc
+                    chosen = n; break
+                end
+            end
+            @assert chosen !== nothing "sampling failed at t=$t (check child p_cond sums to 1)"
+
+            node_ids[t] = chosen.id
+            ω[t]        = chosen.ω
+            p          *= chosen.p_cond
+            parent      = chosen.id
+        end
+
+        out[s] = Trajectory(node_ids, ω, p)
+    end
+
+    return out
 end
 
 "Algorithm container."
@@ -183,12 +215,22 @@ mutable struct SDDP
     V::Vector{ValueFn{Float64}}              # V[1..T]
     T::Int
     γ::Float64
-    trial_points::Vector{Vector{Vector{Float64}}}
 end
 
 function SDDP(stages::Vector{Stage}; discount::Float64=1.0)
     T = length(stages)
     V = [ValueFn{Float64}() for _ in 1:T]
-    SDDP(stages, V, T, discount, [Vector{Vector{Float64}}() for _ in 1:T])
+    SDDP(stages, V, T, discount)
 end
+
+function check_omega(ω::OmegaRef{T}, n::Int, m::Int) where T
+    @assert size(ω.base.A) == (n,n)
+    @assert size(ω.base.B) == (n,m)
+    @assert size(ω.base.G,2) == m
+    @assert length(ω.d) == n
+    @assert length(ω.c_x) == n
+    @assert length(ω.c_u) == m
+    @assert length(ω.h) == size(ω.base.G,1)
+end
+
 
