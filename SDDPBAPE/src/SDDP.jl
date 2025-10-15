@@ -28,7 +28,7 @@ end
 "Add a cut if it is new/useful (very basic dominance filtering)."
 function add_cut!(v::ValueFn{T}, α::T, β::Vector{T}, stage::Int; atol=1e-8) where {T}
     for c in v.cuts
-        if abs(c.α - α) <= atol && norm(c.β - β) <= atol
+        if abs(c.α - α) ≤ atol && norm(c.β - β) ≤ atol
             return false
         end
     end
@@ -36,31 +36,61 @@ function add_cut!(v::ValueFn{T}, α::T, β::Vector{T}, stage::Int; atol=1e-8) wh
     return true
 end
 
-"Stage definition: user supplies a builder to create the JuMP model for a given ω."
+"""
+Stage definition: user supplies builder + stochastic interface.
+
+Fields:
+- t, state_dim
+- build(t, vf_next, ω; fix_state)
+- sampler() -> ω
+- weight(ω) -> probability/weight
+- children(t, ctx) -> (Ωs, ps)  with sum(ps)==1
+- next_ctx(t, ctx, ω) -> ctx_{t+1}
+- node_key(ctx) -> hashable key for node grouping
+"""
 struct Stage
     t::Int
     state_dim::Int
-    build::Function   # (t, vf_next, ω; fix_state=nothing) -> (model, x_state, θ, misc)
-    sampler::Function # () -> ω
-    weight::Function  # ω -> probability/weight
+    build::Function
+    sampler::Function
+    weight::Function
+    children::Function
+    next_ctx::Function
+    node_key::Function
 end
 
-"Scenario tree + trajectories (optional, if you want deterministic trees/sampling)."
-struct TreeNode{Ω}
-    id::Int
-    parent::Union{Nothing,Int}
-    ω::Ω
-    p_cond::Float64
-end
-struct ScenarioTree{Ω}
-    levels::Vector{Vector{TreeNode{Ω}}}
-end
-struct Trajectory{Ω}
-    node_ids::Vector{Int}
-    ω::Vector{Ω}
-    p::Float64
+# Convenience constructors for common cases -------------------------------------
+
+# Case A: Xi_t is constant (no context), ps constant:
+function Stage_constant_Xi(; t, state_dim, build, sampler, weight, Xi, pXi)
+    _children = (tt, ctx)->begin
+        @assert tt == t
+        @assert abs(sum(pXi) - 1.0) < 1e-12
+        return (Xi, pXi)
+    end
+    Stage(t, state_dim, build, sampler, weight, _children,
+          (tt, ctx, ω)->nothing, # next_ctx
+          x->x)                   # node_key (identity; ctx=nothing, so all visits group)
 end
 
+# Case B: Xi_t depends on a small discrete Markov state ctx::Int
+function Stage_markov_Xi(; t, state_dim, build, sampler, weight, Xi_of, pXi_of, next_ctx, node_key = x->x)
+    _children = (tt, ctx)->begin
+        @assert tt == t
+        Xi = Xi_of(ctx)
+        ps = pXi_of(ctx)
+        @assert abs(sum(ps) - 1.0) < 1e-12
+        return (Xi, ps)
+    end
+    Stage(t, state_dim, build, sampler, weight, _children, next_ctx, node_key)
+end
+
+"Minimal path container for conditional/importance-weighted passes."
+    struct Trajectory{Ω}
+    ω::Vector{Ω}            # disturbances along the path
+    w::Float64              # path weight (importance weight or 1/S)
+    meta::Dict{Symbol,Any}  # optional tags (e.g., :regime => :dry, :rare => true)
+end
 
 # Keep it simple: only 1 type parameter, and fields typed to AbstractMatrix{T}
 struct BaseStageData{T}
@@ -111,9 +141,6 @@ OmegaRef(; base::BaseStageData, c_u, c_x, d, h) = OmegaRef(base, c_u, c_x, d, h)
 
 
 
-
-
-
 struct OmegaStageData{T}
     c_u::Vector{T}
     c_x::Vector{T}
@@ -125,89 +152,6 @@ struct OmegaStageData{T}
 end
 
 
-# Enumerate all root→leaf trajectories
-function enumerate_trajectories(tree::ScenarioTree{Ω}) where {Ω}
-    T = length(tree.levels)
-    results = Trajectory{Ω}[]
-    nodebuf = Vector{Int}(undef, T)
-    ωbuf    = Vector{Ω}(undef, T)
-
-    function rec(t::Int, parent_id::Union{Nothing,Int}, p::Float64)
-        if t == 1
-            for n in tree.levels[1]
-                nodebuf[1] = n.id
-                ωbuf[1]    = n.ω
-                rec(2, n.id, p * n.p_cond)
-            end
-            return
-        end
-        if t > T
-            push!(results, Trajectory(copy(nodebuf), copy(ωbuf), p))
-            return
-        end
-        for n in tree.levels[t]
-            if n.parent == parent_id
-                nodebuf[t] = n.id
-                ωbuf[t]    = n.ω
-                rec(t+1, n.id, p * n.p_cond)
-            end
-        end
-    end
-
-    rec(1, nothing, 1.0)
-    return results
-end
-
-# Sample n trajectories IID from the tree distribution
-function sample_trajectories(tree::ScenarioTree{Ω}, n_samples::Int) where {Ω}
-    T   = length(tree.levels)
-    out = Vector{Trajectory{Ω}}(undef, n_samples)
-
-    for s in 1:n_samples
-        node_ids = Vector{Int}(undef, T)
-        ω        = Vector{Ω}(undef, T)
-        p        = 1.0
-
-        # root
-        r = rand(); acc = 0.0
-        root = nothing
-        for n in tree.levels[1]
-            acc += n.p_cond
-            if r <= acc
-                root = n; break
-            end
-        end
-        @assert root !== nothing "root sampling failed (check root p_cond sums to 1)"
-
-        node_ids[1] = root.id
-        ω[1]        = root.ω
-        p          *= root.p_cond
-        parent      = root.id
-
-        # descend
-        for t in 2:T
-            children = (n for n in tree.levels[t] if n.parent == parent)
-            r = rand(); acc = 0.0
-            chosen = nothing
-            for n in children
-                acc += n.p_cond
-                if r <= acc
-                    chosen = n; break
-                end
-            end
-            @assert chosen !== nothing "sampling failed at t=$t (check child p_cond sums to 1)"
-
-            node_ids[t] = chosen.id
-            ω[t]        = chosen.ω
-            p          *= chosen.p_cond
-            parent      = chosen.id
-        end
-
-        out[s] = Trajectory(node_ids, ω, p)
-    end
-
-    return out
-end
 
 "Algorithm container."
 mutable struct SDDP
@@ -223,14 +167,130 @@ function SDDP(stages::Vector{Stage}; discount::Float64=1.0)
     SDDP(stages, V, T, discount)
 end
 
-function check_omega(ω::OmegaRef{T}, n::Int, m::Int) where T
-    @assert size(ω.base.A) == (n,n)
-    @assert size(ω.base.B) == (n,m)
-    @assert size(ω.base.G,2) == m
-    @assert length(ω.d) == n
-    @assert length(ω.c_x) == n
-    @assert length(ω.c_u) == m
-    @assert length(ω.h) == size(ω.base.G,1)
+
+"""
+    run_sddp!(m::SDDP;
+        x0::AbstractVector,
+        ctx0=nothing,
+        mode::Symbol = :online,
+        trajectories = nothing,
+        S::Int = 1,
+        max_iter::Int = 1_000,
+        patience::Int = 20,
+        value_tol::Float64 = 0.0,
+        evaluate_index::Int = 1,
+        rng = Random.default_rng(),
+        force_every::Int = 10,
+        cut_atol::Float64 = 1e-8,
+        logfn = nothing,
+    ) -> NamedTuple
+
+General SDDP training loop.
+
+- Works with your `Stage` API (sampling via `Stage.sampler` and expectations via `Stage.children`).
+- Two modes:
+  - `:online` (default): sample ω on-the-fly (`forward_pass_online!`) and build **expected** cuts per visited node (`backward_pass_expected!`).
+  - `:tree`: use a provided `trajectories::Vector{Trajectory}` and call `forward_pass!` + `backward_pass!`.
+
+Stopping rules:
+- `patience`: stop if **no new cuts** for this many consecutive iterations.
+- `value_tol`: optional absolute tolerance on change of `V_{evaluate_index}(x0)`; set `≤ 0` to disable.
+
+Keyword args:
+- `S`: rollouts per iteration in `:online` mode.
+- `force_every`: even if a node looks inactive, add an “activity-forced” cut every `force_every` iterations
+  (your `backward_pass_expected!` already supports this).
+- `cut_atol`: passed through to backward pass as a numerical tolerance for cut dominance/equality.
+- `logfn`: optional callback `logfn(it, stats::NamedTuple)` called each iteration.
+
+Returns a `NamedTuple` with fields:
+- `iters`, `cuts_per_stage`, `history` (per-iteration stats vector).
+"""
+function run_sddp!(m::SDDP;
+    x0::AbstractVector,
+    ctx0=nothing,
+    mode::Symbol = :online,
+    trajectories = nothing,
+    S::Int = 1,
+    max_iter::Int = 1_000,
+    patience::Int = 20,
+    value_tol::Float64 = 0.0,
+    evaluate_index::Int = 1,
+    rng = Random.default_rng(),
+    force_every::Int = 10,
+    cut_atol::Float64 = 1e-8,
+    logfn = nothing,
+)
+
+    # small helpers
+    total_cuts() = sum(length(m.V[t].cuts) for t in 1:m.T)
+    cuts_by_stage() = [length(m.V[t].cuts) for t in 1:m.T]
+
+    # initial monitors
+    prev_total = total_cuts()
+    stagnant   = 0
+    prev_V, _  = evaluate(m.V[evaluate_index], x0)
+
+    # collect iteration stats for the caller
+    hist = Vector{NamedTuple}()
+
+    # ensure RNG is set for sampling (user can pass their own rng)
+    Random.seed!(rng, rand(UInt))  # ensures independence across separate runs if user wants
+
+    for it in 1:max_iter
+        # -------- Forward --------
+        fwd = if mode === :online
+            forward_pass_online!(m; S=S, x0=x0, ctx0=ctx0)
+        elseif mode === :tree
+            trajectories === nothing &&
+                error("run_sddp!: `mode=:tree` requires `trajectories` kwarg.")
+            forward_pass!(m; trajectories=trajectories, x0=x0, ctx0=ctx0)
+        else
+            error("run_sddp!: unknown mode = $(mode). Use :online or :tree.")
+        end
+
+        # -------- Backward --------
+        if mode === :online
+            # one expected cut per visited node using (Xi, pXi)
+            backward_pass_expected!(m; fwd=fwd, iter=it, force_every=force_every, atol=cut_atol)
+        else
+            backward_pass!(m; trajectories=trajectories, fwd=fwd)
+        end
+
+        # -------- Logging & stopping --------
+        cur_total = total_cuts()
+        new_cuts  = cur_total - prev_total
+        prev_total = cur_total
+
+        cur_V, _ = evaluate(m.V[evaluate_index], x0)
+        ΔV       = abs(cur_V - prev_V)
+        prev_V   = cur_V
+
+        stats = (iter=it, new_cuts=new_cuts, total_cuts=cur_total,
+                 V=cur_V, ΔV=ΔV, per_stage=cuts_by_stage())
+        push!(hist, stats)
+
+        # default console log (if no logfn provided)
+        if logfn === nothing
+            @printf "iter %4d | new cuts: %2d | total: %3d | V%d(x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_index cur_V ΔV
+        else
+            logfn(it, stats)
+        end
+
+        stagnant = (new_cuts == 0) ? (stagnant + 1) : 0
+        if stagnant >= patience
+            println("Early stop: no new cuts for $patience consecutive iterations.")
+            return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+        if value_tol > 0 && ΔV ≤ value_tol
+            println("Early stop: |ΔV| ≤ $value_tol.")
+            return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+    end
+
+    println("Reached max_iter without early stop.")
+    return (iters=max_iter, cuts_per_stage=cuts_by_stage(), history=hist)
 end
+
 
 
