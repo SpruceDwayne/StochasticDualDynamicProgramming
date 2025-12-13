@@ -1,7 +1,10 @@
 using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", "SDDPBAPE"))
-#Pkg.instantiate()   # only needed the first time on a new checkout
+Pkg.resolve()        # clears those “dependencies changed” warnings
+Pkg.instantiate()  # only needed the first time on a new checkout
+Pkg.precompile()
 using SDDPBAPE
+
 
 using JuMP, HiGHS, LinearAlgebra
 using Printf
@@ -30,9 +33,9 @@ const HARD_TERMINAL = false
 
 function build_stage_model(t::Int, vf_next::ValueFn{Float64}, ω::Float64;
                            fix_state::Union{Nothing,Vector{Float64}}=nothing,
-                           ucap::Float64 = Inf)   # NEW: absolute cap
+                           ucap::Float64 = Inf)   
     model = Model(HiGHS.Optimizer); set_silent(model)
-    n = 1  # your toy
+    n = 1  #only 1 rescource to allocate in this case
 
     @variable(model, x_state[1:n])
     @variable(model, x_next[1:n] >= 0)
@@ -45,7 +48,7 @@ function build_stage_model(t::Int, vf_next::ValueFn{Float64}, ω::Float64;
     # Feasibility
     @constraint(model, x <= x_state[1])            # cannot spend more than you have
     if isfinite(ucap)
-        @constraint(model, x <= ucap)              # NEW: absolute cap
+        @constraint(model, x <= ucap)             
     end
 
     # Dynamics
@@ -82,7 +85,6 @@ end
 #   - node_key(): groups all visits at stage t (ctx=nothing)
 # -----------------------
 
-# If you kept the helper Stage_constant_Xi in your package, this is the cleanest:
 have_helper = isdefined(SDDPBAPE, :Stage_constant_Xi)
 
 ucap = 40.0  # e.g., can spend at most 30 per stage
@@ -176,73 +178,6 @@ m = SDDP(stages0_T; discount=γ)
 using Random
 Random.seed!(1234)  # reproducible sampling (optional)
 
-"""
-Train SDDP until cuts stagnate (or max_iter reached).
-
-Arguments
-- m::SDDP                      : your SDDP container
-- x0::Vector{Float64}         : initial state (e.g., B0)
-- S::Int                      : rollouts per iteration (default 1)
-- max_iter::Int               : max outer iterations (default 1000)
-- patience::Int               : stop if no new cuts for this many consecutive iters (default 20)
-- value_tol::Float64          : optional absolute tolerance on V1(x0) change (set ≤ 0 to disable)
-
-Returns
-- (iters_done, cuts_per_stage) where cuts_per_stage is a Vector{Int}
-"""
-function run_sddp_old!(m::SDDP; x0::Vector{Float64}, S::Int=1, max_iter::Int=1000,
-                   patience::Int=20, value_tol::Float64=0.0)
-
-    # helpers to count cuts and monitor value
-    total_cuts() = sum(length(m.V[t].cuts) for t in 1:m.T)
-    cuts_by_stage() = [length(m.V[t].cuts) for t in 1:m.T]
-
-    prev_total = total_cuts()
-    stagnant = 0
-
-    prev_V1, _ = evaluate(m.V[1], x0)
-
-    for it in 1:max_iter
-        # Forward: sample ω on the fly (no explicit tree)
-        fwd = forward_pass_online!(m; S=S, x0=x0, ctx0=nothing)
-
-        # Backward: add one expected cut per visited node, using (Xi, pXi)
-        backward_pass_expected!(m; fwd=fwd, iter=it, force_every=10, atol=1e-8)
-
-        # Stagnation checks
-        cur_total = total_cuts()
-        new_cuts = cur_total - prev_total
-        prev_total = cur_total
-
-        cur_V1, _ = evaluate(m.V[1], x0)
-        ΔV = abs(cur_V1 - prev_V1)
-        prev_V1 = cur_V1
-
-        println(@sprintf("iter %4d | new cuts: %2d | total: %3d | V1(x0)=%.6f | ΔV=%.3e",
-                         it, new_cuts, cur_total, cur_V1, ΔV))
-
-        if new_cuts == 0
-            stagnant += 1
-        else
-            stagnant = 0
-        end
-
-        # stop if no new cuts for 'patience' iters
-        if stagnant >= patience
-            println("Early stop: no new cuts for $patience consecutive iterations.")
-            return it, cuts_by_stage()
-        end
-
-        # optional value-convergence stop
-        if value_tol > 0 && ΔV ≤ value_tol
-            println("Early stop: |ΔV1(x0)| ≤ $value_tol.")
-            return it, cuts_by_stage()
-        end
-    end
-
-    println("Reached max_iter without triggering early stop.")
-    return max_iter, cuts_by_stage()
-end
 
 
 
@@ -252,9 +187,6 @@ println("Stopped after $iters iterations. Cuts per stage = ", cuts_per_stage)
 
 
 ######Investigate results##################
-
-using Plots
-
 
 # ---------------- Example usage ----------------
 # Pick which continuation V to use:
@@ -287,9 +219,10 @@ end
 println("min(-β)=", minimum(marg), "  max(-β)=", maximum(marg))
 
 
+println(marg)
 ###############
 # inspect the time-0 objective and its “argmin set”
-function time0_objective_curve(m; B0=100.0, c0=1.05, v_index=2, step=1.0)
+function time0_objective_curve(m; B0=100.0, c0=1.06, v_index=2, step=1.0)
     xs   = 0.0:step:B0
     vals = Float64[]
     for x0 in xs
@@ -301,11 +234,17 @@ function time0_objective_curve(m; B0=100.0, c0=1.05, v_index=2, step=1.0)
     return xs, vals, minval, mins
 end
 
-xs, vals, minval, mins = time0_objective_curve(m; B0=100.0, c0=1.05, v_index=2, step=1.0)
+xs, vals, minval, mins = time0_objective_curve(m; B0=100.0, c0=1.06, v_index=2, step=1.0)
 println("min objective = $minval at x0 in ", mins)
 
+println(vals)
+println(xs)
+print(mins)
 
+using Plots
 
+mask = xs .<= 90           # Boolean mask
+plot(xs[mask], vals[mask])
 ################Check if we found the correct solution by solving DEF #########
 
 x0_star_det, obj_det, ef_model =
@@ -318,3 +257,63 @@ x0_star_det, obj_det, ef_model =
     )
 
 println("EF says x0* = ", x0_star_det[1], ", obj = ", obj_det)
+
+
+
+
+res = run_sddp!(m; x0=B0, ctx0=nothing, max_iter=300)
+
+using Plots
+
+
+"""
+    plot_cuts_1d(v::ValueFn, xs; x_max = nothing)
+
+Plot all affine cuts (lines) for a 1D value function over the grid xs.
+If x_max is given, only use points with x ≤ x_max.
+Also plots the envelope V(x) = max_k (α_k + β_k x).
+"""
+function plot_cuts_1d(v::ValueFn, xs::AbstractVector{<:Real}; x_max = nothing,x_min=nothing)
+    xs_plot = collect(xs)
+    if x_max !== nothing
+        mask = xs_plot .<= x_max
+        xs_plot = xs_plot[mask]
+    end
+    if x_min !== nothing
+        mask = xs_plot .>= x_min
+        xs_plot = xs_plot[mask]
+    end
+
+    @assert !isempty(v.cuts) "ValueFn has no cuts to plot."
+    @assert length(v.cuts[1].β) == 1 "plot_cuts_1d_labeled assumes 1D state."
+
+    p = plot(
+        xlabel = "B_0-x_0",
+        ylabel = "Q_1(B_0-x_0)",
+        title  = "Affine cuts",
+        legend = true
+    )
+
+    # --- Plot each affine cut with a label corresponding to its order
+    for (i, c) in enumerate(v.cuts)
+        ys = @. c.α + c.β[1] * xs_plot
+        plot!(
+            p,
+            xs_plot,
+            ys,
+            lw = 1,
+            alpha = 0.5,
+            label = "cut #$i"
+        )
+    end
+
+    return p
+end
+# Suppose you have:
+#   xs   = your grid over x
+#   v    = m.V[t]  (or any ValueFn)
+
+plot_cuts_1d(m.V[1], xs; x_max = 100,x_min=0)  # only up to x ≤ 60
+
+
+
