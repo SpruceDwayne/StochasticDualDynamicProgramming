@@ -487,7 +487,8 @@ function run_markov_sddp_rho!(m::MarkovSDDP;
                               cut_atol::Float64 = 1e-8,
                               alpha::Float64,
                               lambda::Float64,
-                              logfn = nothing)
+                              logfn = nothing,
+                              VALUE_CHECK_WINDOW=200)
 
     @assert 0.0 ≤ lambda ≤ 1.0 "lambda must be in [0,1]."
     @assert 0.0 ≤ alpha  < 1.0 "alpha must be in [0,1)."
@@ -499,10 +500,12 @@ function run_markov_sddp_rho!(m::MarkovSDDP;
         init = 0,
     )
 
-    cuts_by_stage() = [
+    function cuts_by_stage()
+    [
         sum(vf -> length(vf.cuts), values(m.V[t]); init = 0)
         for t in 1:m.T
     ]
+end
 
     prev_total = total_cuts()
     stagnant   = 0
@@ -512,7 +515,7 @@ function run_markov_sddp_rho!(m::MarkovSDDP;
     prev_V, _ = evaluate(vf_eval, x0)
 
     # For relative improvement check over a iteration window
-    const VALUE_CHECK_WINDOW = 200
+    #VALUE_CHECK_WINDOW = 200
     last_check_V = prev_V  # V at last value_tol check
 
     hist = Vector{NamedTuple}()

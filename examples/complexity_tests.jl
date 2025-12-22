@@ -2,7 +2,7 @@ using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", "SDDPBAPE"))
 Pkg.instantiate()
 Pkg.precompile()
-
+1+1
 using SDDPBAPE
 using JuMP, HiGHS, Random
 using CSV, DataFrames, Statistics
@@ -26,7 +26,8 @@ const K = length(reg_vals)
 reg_index = Dict(r => i for (i, r) in enumerate(reg_vals))
 
 # Scenario reduction (optional)
-max_scen = 40
+max_scen = 20
+const T_rand = 10
 
 df_small = DataFrame()
 for r in reg_vals
@@ -100,7 +101,6 @@ end
 # Model parameters
 # ============================================================
 
-const T_rand    = 15        # number of random years (horizon in years)
 const γ         = 1.0       # discount
 const state_dim = 5         # [w_t, l_t, c_t, ltilde_t, x_{t-1}]
 
@@ -210,9 +210,10 @@ function build_stage_model(t::Int,
     :x_next   => x_next,
     :xnext_eq => [w_eq, l_eq, c_eq, ltilde_eq, xcarry_eq],
     :c_x      => zeros(state_dim),
-    :b        => b,          # <-- bonus
-    :x_dec    => x,    # <-- decision x_t for "logging"
-    :b        => b,    # <-- bonus b_t for "logging"
+    :x_dec    => x,        # decision x_t
+    :b        => b,        # decision b_t
+    :s_inf    => s_inf,
+    :s_fund   => s_fund,
 )
 
 
@@ -351,46 +352,6 @@ m = MarkovSDDP(stages; discount = γ)
 z0_reg = reg_vals[1]
 z0     = reg_index[z0_reg]
 
-alpha_risk  = 0.90
-lambda_risk = 0.5
-
-res = run_markov_sddp_rho!(m;
-    x0             = x0_state,
-    ctx0           = z0,
-    S              = 1,
-    max_iter       = 800,
-    patience       = 30,
-    value_tol      = 0.0,
-    evaluate_stage = 1, 
-    evaluate_ctx   = z0,
-    alpha          = alpha_risk,
-    lambda         = lambda_risk
-)   
-
-println("Finished after $(res.iters) iterations.")
-println("Cuts per stage (summed over Markov states) = ", res.cuts_per_stage)
-
-# ============================================================
-# Recover optimal x₀ using learned V₁
-# ============================================================
-
-vf1 = get_V!(m, 2, z0)
-
-model0, x_state0, θ0, misc0 = build_stage0(
-    1, vf1, nothing;
-    fix_state = x0_state,
-)
-
-optimize!(model0)
-
-x0_star = value(misc0[:x_next][5])
-w1_star = value(misc0[:x_next][1])
-l1_star = value(misc0[:x_next][2])
-
-println("\n--- Risk-neutral fund's initial decision ---")
-println("x₀* = ", x0_star)
-println("w₁  = ", w1_star)
-println("l₁  = ", l1_star)
 
 
 ####Then to examine the policy we simulate it and store it as a CSV to be analysed elsewhere
@@ -399,95 +360,90 @@ using DataFrames,CSV
 function simulate_policy(m::MarkovSDDP;
                          x0::Vector{Float64},
                          ctx0,
-                         T::Int = m.T,      # default: simulate full horizon
+                         T::Int = m.T,
                          Nsim::Int = 100,
                          rng = Random.default_rng())
 
     rows = DataFrame(
         scenario = Int[],
         t        = Int[],
-        regime   = Int[],
+        regime   = Int[],        # current Markov state z_t (before transition)
+        w_prev   = Float64[],
+        l_prev   = Float64[],
+        c_prev   = Float64[],
+        ltilde_prev = Float64[],
+        x_prev   = Float64[],
+        # decisions taken at stage t
+        x_dec    = Float64[],
+        b_dec    = Union{Missing,Float64}[],
+        # post-decision / post-dynamics state
         w        = Float64[],
         l        = Float64[],
         c        = Float64[],
         ltilde   = Float64[],
-        x_prev   = Float64[],
-        x_dec    = Float64[],
-        b_dec    = Union{Missing,Float64}[],  
-        s_inf    = Union{Missing,Float64}[],
-        s_fund   = Union{Missing,Float64}[],
+        x_carry  = Float64[],    # equals x_dec
+        # shocks
         a        = Union{Missing,Float64}[],
         r        = Union{Missing,Float64}[],
         pi       = Union{Missing,Float64}[],
+        # slacks
+        s_inf    = Union{Missing,Float64}[],
+        s_fund   = Union{Missing,Float64}[],
+        # diagnostics
+        FR       = Union{Missing,Float64}[],  # funding ratio at t: w_t/(a_t*l_t)
+        IR       = Union{Missing,Float64}[],  # indexation ratio at t: l_t/ltilde_t
     )
 
     for s in 1:Nsim
         x_state = copy(x0)   # [w, l, c, ltilde, x_prev]
-        ctx     = ctx0       # Markov state (regime)
+        ctx     = ctx0       # Markov state
 
         for t in 1:T
             stage = m.stages[t]
+            ω = stage.sampler(ctx)  # `nothing` at stage 1 (deterministic)
 
-            # --- Sample shock using the stage's sampler ---------------------
-            ω = stage.sampler(ctx)  # for deterministic stage0 this is `nothing`
-
-            # --- Choose continuation value function just like forward pass ---
             vf_next = if t < m.T
-                get_V!(m, t+1, ctx)   # policy uses V_{t+1}^{ctx}
+                get_V!(m, t+1, ctx)
             else
-                ValueFn{Float64}()    # terminal
+                ValueFn{Float64}()
             end
 
-            # --- Build and solve stage-t model ------------------------------
-            model, x_state_var, θ, misc =
-                stage.build(t, vf_next, ω; fix_state = x_state)
-
+            model, _, _, misc = stage.build(t, vf_next, ω; fix_state = x_state)
             optimize!(model)
 
-            # --- Next state from solved model -------------------------------
             x_next = value.(misc[:x_next])  # [w_t, l_t, c_t, ltilde_t, x_t]
 
-            # Pre-decision state (at beginning of period t)
-            w_prev      = x_state[1]
-            l_prev      = x_state[2]
-            c_prev      = x_state[3]
-            ltilde_prev = x_state[4]
-            x_prev      = x_state[5]
+            # pre
+            w_prev, l_prev, c_prev, ltilde_prev, x_prev = x_state
 
-            # Decision at time t: x_t is stored in next state's 5th component
+            # decisions
             x_dec = x_next[5]
-            
             b_val = haskey(misc, :b) ? value(misc[:b]) : missing
 
-            # Slacks (only defined in random stages)
             s_inf  = haskey(misc, :s_inf)  ? value(misc[:s_inf])  : missing
             s_fund = haskey(misc, :s_fund) ? value(misc[:s_fund]) : missing
 
-            # Shock components (only for XiShock stages)
             a_val  = (ω isa XiShock) ? ω.a  : missing
             r_val  = (ω isa XiShock) ? ω.r  : missing
             pi_val = (ω isa XiShock) ? ω.pi : missing
 
-            # --- Log one row ------------------------------------------------
+            # post
+            w_t, l_t, c_t, ltilde_t, x_carry = x_next
+
+            # diagnostics (only defined when we have a_t)
+            FR = (ω isa XiShock) ? (w_t / (ω.a * l_t)) : missing
+            IR = l_t / ltilde_t
+
             push!(rows, (
-                s,                   # scenario
-                t,                   # time
-                ctx,                 # regime / Markov state
-                w_prev,              # w_{t-1}
-                l_prev,              # l_{t-1}
-                c_prev,              # c_{t-1}
-                ltilde_prev,         # ltilde_{t-1}
-                x_prev,              # x_{t-2}
-                x_dec,               # x_t
-                b_val,               # b_t
-                s_inf,
-                s_fund,
-                a_val,
-                r_val,
-                pi_val,
+                s, t, ctx,
+                w_prev, l_prev, c_prev, ltilde_prev, x_prev,
+                x_dec, b_val,
+                w_t, l_t, c_t, ltilde_t, x_carry,
+                a_val, r_val, pi_val,
+                s_inf, s_fund,
+                FR, IR
             ))
 
-            # --- Move to next period ---------------------------------------
             x_state = x_next
             ctx     = stage.next_ctx(t, ctx, ω)
         end
@@ -496,16 +452,118 @@ function simulate_policy(m::MarkovSDDP;
     return rows
 end
 
+function build_markov_model(; T_rand::Int, state_dim::Int=5, γ::Float64=1.0)
+    stage0 = Stage_deterministic(
+        t = 1, state_dim = state_dim,
+        build = (tt, vf_next, ω; fix_state=nothing) ->
+            build_stage0(tt, vf_next, ω; fix_state=fix_state)
+    )
+    stages_rand = [make_markov_stage(t) for t in 2:(T_rand+1)]
+    stages = vcat([stage0], stages_rand)
+    return MarkovSDDP(stages; discount = γ)
+end
+
+function risk_neutral_expected_cost(df_sim::DataFrame; α::Float64, β::Float64, γ::Float64=1.0)
+    # stage cost only defined where slacks exist (random stages)
+    # treat missing slacks as 0 just in case
+    s_inf  = coalesce.(df_sim.s_inf,  0.0)
+    s_fund = coalesce.(df_sim.s_fund, 0.0)
+
+    stage_cost = α .* s_inf .+ β .* s_fund
+
+    # discount by stage index t (your stage 1 is deterministic)
+    disc = γ .^ (df_sim.t .- 1)
+
+    total_cost_by_row = disc .* stage_cost
+
+    # Average over scenarios of (sum over t)
+    # Each scenario has multiple rows: group then sum.
+    g = groupby(DataFrame(cost=total_cost_by_row, scenario=df_sim.scenario), :scenario)
+    scenario_costs = combine(g, :cost => sum => :J).J
+
+    return mean(scenario_costs)
+end
 
 
-S_sim = 1000  # number of Monte Carlo paths
-df_sim = simulate_policy(m;
-    x0 = x0_state,
-    ctx0 = z0,
-    T = T_rand,
-    Nsim = 1000
+
+
+alpha_risk = 0.80
+#lambdas = [0.0,0.1,0.2, 0.3,0.4, 0.5,0.6,0.7, 0.8,0.9,1.0]   # pick your grid
+lambdas = [0.4, 0.5,0.6,0.7, 0.8,0.9,1.0]   
+
+# initial regime
+z0_reg = reg_vals[1]
+z0     = reg_index[z0_reg]
+
+# run settings (keep smaller to be fast)
+max_iter = 1500
+patience = 100
+
+summary = DataFrame(
+    lambda_risk = Float64[],
+    iters = Int[],
+    cuts_total = Int[],
+    P_FR_T_lt_1 = Float64[],
+    P_IR_T_lt_1 = Float64[],
+    E_FR_T = Float64[],
+    E_IR_T = Float64[],
+    E_cost_RN = Float64[],    # <-- NEW: risk-neutral expected cost
 )
 
-CSV.write("simulated_paths_beta1point5_lambda_risk05_w0_105_c009kappa07_lambdafund1gamma975_V2_kappa_inf98.csv", df_sim)
 
+for λρ in lambdas
+    println("\n=== Solving for lambda_risk = $λρ ===")
+
+    m = build_markov_model(T_rand=T_rand, state_dim=state_dim, γ=γ)
+
+    res = run_markov_sddp_rho!(m;
+        x0             = x0_state,
+        ctx0           = z0,
+        S              = 1,
+        max_iter       = max_iter,
+        patience       = patience,
+        value_tol      = 0.005,
+        evaluate_stage = 1,
+        evaluate_ctx   = z0,
+        alpha          = alpha_risk,
+        lambda         = λρ
+    )
+
+    # include deterministic stage 1 + T_rand random stages:
+    sim_horizon = T_rand + 1
+    Random.seed!(2025)
+
+    df_sim = simulate_policy(m; x0=x0_state, ctx0=z0, T=sim_horizon, Nsim=1000)
+
+    df_T = df_sim[df_sim.t .== sim_horizon, :]
+    # FR is missing at t=1 but should be defined at terminal (random stage), so safe here
+    FR_T = skipmissing(df_T.FR)
+    IR_T = skipmissing(df_T.IR)
+
+    p_FR = mean(collect(FR_T) .< 1.0)
+    p_IR = mean(collect(IR_T) .< 1.0)
+
+    E_FR = mean(collect(FR_T))
+    E_IR = mean(collect(IR_T))
+    E_cost_RN = risk_neutral_expected_cost(df_sim; α=α, β=β, γ=γ)
+
+    cuts_total = sum(res.cuts_per_stage)
+
+    push!(summary, (
+    λρ, res.iters, cuts_total,
+    p_FR, p_IR,
+    E_FR, E_IR,
+    E_cost_RN
+))
+
+
+    # write simulation csv for plotting later
+    out_csv = "sim_paths_T10_Xi20_lambda$(round(λρ, digits=2))_alpha$(alpha_risk).csv"
+    CSV.write(out_csv, df_sim)
+
+    println("iters=$(res.iters), P(FR_T<1)=$(round(p_FR, digits=4)), P(IR_T<1)=$(round(p_IR, digits=4))")
+end
+
+CSV.write("risk_aversion_sweep_summary_alpha08.csv", summary)
+println("\nWrote risk_aversion_sweep_summary.csv")
 
