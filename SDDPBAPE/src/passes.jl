@@ -10,6 +10,18 @@ struct ForwardRecord
     ctx::Vector{Vector{Any}}                  # ctx[s][t]  (node context at stage t)
 end
 
+
+"ChatGPT suggested improvement in terms of memory"
+struct ForwardRecordMarkov{TX<:AbstractArray, TC<:AbstractArray, TN<:AbstractArray}
+    # x_hist[:, t, s] is the pre-decision state at stage t on path s
+    x_hist::TX          # Float64 array of size (state_dim, T, S)
+    # ctx_hist[t, s] is the Markov state at stage t on path s
+    ctx_hist::TC        # Int array of size (T, S)
+    # node_counts[t, z] = number of paths visiting node (t, z) this iteration
+    node_counts::TN     # Int array of size (T, K) (or Dict if ctx not 1..K)
+end
+
+
 """
 forward_pass!(m::SDDP; trajectories, x0, ctx0=nothing)
 
@@ -165,7 +177,7 @@ What to stash in `misc` (examples):
   )
 """
 function compute_cut!(t::Int, model, stg::Stage, vf_next::ValueFn{Float64},
-                      x_support::Vector{Float64}, ω, misc)::Tuple{Float64,Vector{Float64}}
+                      x_support::AbstractVector{<:Real}, ω, misc)::Tuple{Float64,Vector{Float64}}
 
     n = stg.state_dim
 
@@ -293,3 +305,351 @@ function backward_pass_expected!(m::SDDP; fwd::ForwardRecord, iter::Int=1,
     end
     return nothing
 end
+
+
+################Markov version below##############
+function forward_pass_markov_online_old!(m::MarkovSDDP;
+                                     S::Int,
+                                     x0::Vector{Float64},
+                                     ctx0)
+    T = m.T
+    # x_state[s][t] and ctx[s][t], same layout as ForwardRecord requires
+    x_hist   = [ [zeros(m.stages[t].state_dim) for t in 1:T] for _ in 1:S ]
+    ctx_hist = [ [ctx0 for _ in 1:T] for _ in 1:S ]
+
+    for s in 1:S
+        x   = copy(x0)
+        ctx = ctx0  # Markov state z_t
+        for t in 1:T
+            stg = m.stages[t]
+
+            # Sample shock conditional on current Markov state
+            ωt = stg.sampler(ctx)  # e.g. WeatherShock
+
+            # Pick a continuation value function for policy evaluation in forward pass.
+            vf_next = (t < T) ? get_V!(m, t+1, ctx) : ValueFn{Float64}()
+
+            # Record PRE-decision (x_t, z_t)
+            x_hist[s][t]   = copy(x)
+            ctx_hist[s][t] = ctx
+
+            model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state=x)
+            optimize!(model)
+
+            x   = haskey(misc, :x_next) ? value.(misc[:x_next]) : value.(x_state)
+            #update future state/ctx such that when we run stg.sampler(ctx) in the next iteration of this loop we will sample from that new state/ctx
+            ctx = stg.next_ctx(t, ctx, ωt)
+        end
+    end
+    return ForwardRecord(x_hist, ctx_hist)
+end
+
+
+#ChatGPT suggested improvements in terms of memory
+function forward_pass_markov_online!(m::MarkovSDDP;
+    S::Int,
+    x0::Vector{Float64},
+    ctx0::Int,
+    K::Int,
+    x_hist::Union{Nothing,Array{Float64,3}} = nothing,
+    ctx_hist::Union{Nothing,Matrix{Int}} = nothing,
+    node_counts::Union{Nothing,Matrix{Int}} = nothing
+)
+    T = m.T
+    d = m.stages[1].state_dim
+
+    # Allocate or validate buffers
+    if x_hist === nothing
+        x_hist = Array{Float64,3}(undef, d, T, S)
+    else
+        @assert size(x_hist) == (d, T, S)
+    end
+
+    if ctx_hist === nothing
+        ctx_hist = Array{Int}(undef, T, S)
+    else
+        @assert size(ctx_hist) == (T, S)
+    end
+
+    if node_counts === nothing
+        node_counts = zeros(Int, T, K)
+    else
+        @assert size(node_counts) == (T, K)
+        fill!(node_counts, 0)   # IMPORTANT: reset each call if reused
+    end
+
+    x      = similar(x0)   # reused
+    x_next = similar(x0)   # reused
+    vf_terminal = ValueFn{Float64}()
+
+    for s in 1:S
+        copyto!(x, x0)
+        ctx = ctx0
+
+        @inbounds for t in 1:T
+            stg = m.stages[t]
+
+            # record pre-decision state and ctx
+            copyto!(@view(x_hist[:, t, s]), x)
+            ctx_hist[t, s] = ctx
+            node_counts[t, ctx] += 1
+
+            # sample and solve
+            ωt = stg.sampler(ctx)
+            vf_next = (t < T) ? get_V!(m, t+1, ctx) : vf_terminal
+
+            model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state=x)
+            optimize!(model)
+
+            # update x_next without allocating
+            if haskey(misc, :x_next)
+                x_next_vars = misc[:x_next]
+                @inbounds for i in 1:d
+                    x_next[i] = value(x_next_vars[i])
+                end
+            else
+                @inbounds for i in 1:d
+                    x_next[i] = value(x_state[i])
+                end
+            end
+
+            copyto!(x, x_next)
+            ctx = stg.next_ctx(t, ctx, ωt)
+        end
+    end
+
+    return ForwardRecordMarkov(x_hist, ctx_hist, node_counts)
+end
+
+
+
+
+function backward_pass_markov_expected!(m::MarkovSDDP;
+                                        fwd::ForwardRecord,
+                                        iter::Int = 1,
+                                        force_every::Int = 10,
+                                        atol::Float64 = 1e-8)
+    T = m.T
+    for t in T:-1:1
+        stg = m.stages[t]
+
+        # Bucket scenarios by node key at stage t (here: Markov state)
+        buckets = group_by_node_from_ctx(fwd, m.stages, t)
+
+        for (_key, scen_idx) in buckets
+            # Representative support point at this node
+            s₁        = first(scen_idx)
+            x_support = fwd.x_state[s₁][t]
+            ctx       = fwd.ctx[s₁][t]  # current Markov state z_t
+
+            # Children shocks and probabilities (joint over z_{t+1}, ω)
+            Ωs, ps = stg.children(t, ctx)
+            @assert length(Ωs) == length(ps)
+            @assert abs(sum(ps) - 1.0) < 1e-12
+
+            α_acc = 0.0
+            β_acc = zeros(stg.state_dim)
+
+            # For each child shock, route through the correct continuation V_{t+1}^{ctx_next}
+            for (ω, pω) in zip(Ωs, ps)
+                ctx_next = stg.next_ctx(t, ctx, ω)
+
+                vf_next = if t < T
+                    get_V!(m, t+1, ctx_next)  # create V_{t+1}^{ctx_next} lazily if needed
+                else
+                    ValueFn{Float64}()        # no continuation at final stage
+                end
+
+                model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state=x_support)
+                optimize!(model)
+                misc[:x_state] = get(misc, :x_state, x_state)
+
+                α, β = compute_cut!(t, model, stg, vf_next, x_support, ω, misc)
+
+                α_acc += pω * α
+                β_acc .+= pω .* β
+            end
+
+            # Activity test for THIS Markov state's value function V_t^{ctx}
+            vf_t_ctx = get_V!(m, t, ctx)
+            val_old, _ = evaluate(vf_t_ctx, x_support)
+            val_new    = α_acc + dot(β_acc, x_support)
+
+            should_force = force_every > 0 && (iter % force_every == 0)
+            if should_force || (val_new > val_old + atol)
+                add_cut!(vf_t_ctx, α_acc, β_acc, t)
+            end
+        end
+    end
+    return nothing
+end
+
+##########AVaR below#############
+#Adjust backward_pass_markov_expected such that instead of weighting cuts under the real world measure probabilities pω we solve the dual formulation to obtain new probabilities pw*zetaw
+"""
+    _avar_dual_weights(ps, vals; alpha)
+
+Given probabilities `ps` (sum to 1) and scenario values `vals` (e.g. V_{t+1} at x_support),
+compute the optimal dual weights for AVaR_α using:
+
+    AVaR_α(Z) = max_{ζ}  Σ p_ω ζ_ω Z_ω
+                s.t.    Σ p_ω ζ_ω = 1
+                        0 ≤ ζ_ω ≤ 1/(1-α)
+
+We return λ_ω = p_ω * ζ_ω so that Σ λ_ω = 1 and
+
+    AVaR_α(Z) = Σ λ_ω Z_ω.
+
+`alpha` ∈ [0,1) is the AVaR level.
+"""
+function _avar_dual_weights(ps::AbstractVector{<:Real},
+                            vals::AbstractVector{<:Real};
+                            alpha::Float64)
+    @assert length(ps) == length(vals)
+    @assert 0.0 ≤ alpha < 1.0
+    @assert abs(sum(ps) - 1.0) < 1e-10 "Probabilities must sum to 1."
+
+    n = length(ps)
+    λ = zeros(Float64, n)
+
+    # Capacity per scenario: λ_ω ≤ p_ω / (1-α)
+    cap_scale = 1.0 / (1.0 - alpha)
+
+    # Greedy "fractional knapsack": allocate probability mass to worst scenarios
+    idx = sortperm(vals; rev = true)  # sort by vals descending (worst/biggest)
+    remaining = 1.0
+
+    for k in idx
+        cap = ps[k] * cap_scale
+        assign = min(cap, remaining)
+        λ[k] = assign
+        remaining -= assign
+        if remaining ≤ 1e-12
+            break
+        end
+    end
+
+    @assert remaining ≤ 1e-6 "AVaR dual weights: capacity insufficient; check ps and alpha."
+    return λ
+end
+
+
+
+
+"""
+    backward_pass_markov_rho!(m::MarkovSDDP;
+                              fwd::ForwardRecord,
+                              iter::Int = 1,
+                              force_every::Int = 10,
+                              atol::Float64 = 1e-8,
+                              alpha::Float64,
+                              lambda::Float64)
+
+Markov backward pass under the combined risk measure
+
+    ρ_{α,λ}(Z) = λ E[Z] + (1-λ) AVaR_α(Z).
+
+At each visited node (t, ctx) and support point x_t:
+
+1. For each child shock ω, build a scenario cut (α_ω, β_ω) and compute
+   the scenario value at the support point: v_ω = α_ω + β_ω' x_t.
+
+2. Compute AVaR dual weights λ^{AVaR}_ω using `_avar_dual_weights(ps, v_ω; alpha)`.
+
+3. Form combined weights
+       w_ω = λ * p_ω + (1-λ) * λ^{AVaR}_ω,
+   which satisfy Σ_ω w_ω = 1.
+
+4. Aggregate one cut:
+       V_t^{ctx}(x) ≥ Σ_ω w_ω (α_ω + β_ω' x)
+                    = ᾱ + β̄' x
+
+   with ᾱ = Σ_ω w_ω α_ω,  β̄ = Σ_ω w_ω β_ω.
+
+Special cases:
+- λ = 1 gives the risk-neutral backward pass.
+- λ = 0 gives a pure AVaR backward pass.
+"""
+function backward_pass_markov_rho!(m::MarkovSDDP;
+    fwd::ForwardRecordMarkov,
+    iter::Int = 1,
+    force_every::Int = 10,
+    atol::Float64 = 1e-8,
+    alpha::Float64,
+    lambda::Float64,
+    K::Int
+)
+    @assert 0.0 ≤ lambda ≤ 1.0
+    @assert 0.0 ≤ alpha  < 1.0
+
+    T = m.T
+    S = size(fwd.ctx_hist, 2)
+    vf_terminal = ValueFn{Float64}()
+
+    for t in T:-1:1
+        stg = m.stages[t]
+        d = stg.state_dim
+
+        # process per ctx, reuse children/probs
+        for ctx in 1:K
+            Ωs, ps = stg.children(t, ctx)
+            nω = length(Ωs)
+            nω == 0 && continue
+            @assert nω == length(ps)
+            @assert abs(sum(ps) - 1.0) < 1e-10
+
+            # loop over all visited points in this ctx
+            for s in 1:S
+                fwd.ctx_hist[t, s] == ctx || continue
+                x_support = @view fwd.x_hist[:, t, s]
+
+                α_vec = zeros(Float64, nω)
+                vals  = zeros(Float64, nω)
+                β_mat = zeros(Float64, d, nω)
+
+                for k in 1:nω
+                    ω = Ωs[k]
+                    ctx_next = stg.next_ctx(t, ctx, ω)
+                    vf_next = (t < T) ? get_V!(m, t+1, ctx_next) : vf_terminal
+
+                    model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state = x_support)
+                    optimize!(model)
+                    misc[:x_state] = get(misc, :x_state, x_state)
+
+                    αω, βω = compute_cut!(t, model, stg, vf_next, x_support, ω, misc)
+                    α_vec[k] = αω
+                    @inbounds for i in 1:d
+                        β_mat[i, k] = βω[i]
+                    end
+                    vals[k] = αω + dot(βω, x_support)
+                end
+
+                λ_avar = _avar_dual_weights(ps, vals; alpha = alpha)
+
+                α_acc = 0.0
+                β_acc = zeros(Float64, d)
+                @inbounds for k in 1:nω
+                    wk = lambda * ps[k] + (1.0 - lambda) * λ_avar[k]
+                    α_acc += wk * α_vec[k]
+                    for i in 1:d
+                        β_acc[i] += wk * β_mat[i, k]
+                    end
+                end
+
+                vf_t_ctx = get_V!(m, t, ctx)
+                val_old, _ = evaluate(vf_t_ctx, x_support)
+                val_new    = α_acc + dot(β_acc, x_support)
+
+                should_force = force_every > 0 && (iter % force_every == 0)
+                if should_force || (val_new > val_old + atol)
+                    add_cut!(vf_t_ctx, α_acc, β_acc, t)
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+
+
+

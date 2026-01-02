@@ -1,5 +1,8 @@
 using LinearAlgebra
 using SparseArrays  # if you use SparseMatrixCSC
+using Printf   # <-- simplest
+using Random
+
 
 
 "One affine cut α + β'x tagged with its stage."
@@ -285,6 +288,341 @@ function run_sddp!(m::SDDP;
         if value_tol > 0 && ΔV ≤ value_tol
             println("Early stop: |ΔV| ≤ $value_tol.")
             return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+    end
+
+    println("Reached max_iter without early stop.")
+    return (iters=max_iter, cuts_per_stage=cuts_by_stage(), history=hist)
+end
+
+
+
+############Markov version##################
+mutable struct MarkovSDDP
+    stages::Vector{Stage}
+    # V[t][ctx_key] = ValueFn for stage t and Markov state ctx_key
+    V::Vector{Dict{Any, ValueFn{Float64}}}
+    T::Int
+    γ::Float64
+end
+
+function MarkovSDDP(stages::Vector{Stage}; discount::Float64 = 1.0)
+    T = length(stages)
+    V = [Dict{Any, ValueFn{Float64}}() for _ in 1:T]
+    MarkovSDDP(stages, V, T, discount)
+end
+
+function get_V!(m::MarkovSDDP, t::Int, ctx_key)
+    dict = m.V[t]
+    if !haskey(dict, ctx_key)
+        dict[ctx_key] = ValueFn{Float64}()
+    end
+    return dict[ctx_key]
+end
+
+
+function run_markov_sddp!(m::MarkovSDDP;
+                          x0::AbstractVector,
+                          ctx0,
+                          S::Int = 1,
+                          max_iter::Int = 1_000,
+                          patience::Int = 20,
+                          value_tol::Float64 = 0.0,
+                          evaluate_stage::Int = 1,
+                          evaluate_ctx,
+                          rng = Random.default_rng(),
+                          force_every::Int = 10,
+                          cut_atol::Float64 = 1e-8,
+                          logfn = nothing)
+
+    # Helpers that count cuts across all Markov states at each stage
+    # Helpers that count cuts across all Markov states at each stage
+    total_cuts() = sum(
+        t -> sum(vf -> length(vf.cuts), values(m.V[t]); init = 0),
+        1:m.T;
+        init = 0,
+    )
+
+    cuts_by_stage() = [
+        sum(vf -> length(vf.cuts), values(m.V[t]); init = 0)
+        for t in 1:m.T
+    ]
+
+    prev_total = total_cuts()
+    stagnant   = 0
+
+    # initial value at evaluation (stage, ctx)
+    vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
+    prev_V, _ = evaluate(vf_eval, x0)
+
+    hist = Vector{NamedTuple}()
+
+    Random.seed!(rng, rand(UInt))
+
+    for it in 1:max_iter
+        # -------- Forward pass (Markov-aware) --------
+        fwd = forward_pass_markov_online!(m; S=S, x0=x0, ctx0=ctx0)
+
+        # -------- Backward pass (Markov expected cuts) --------
+        backward_pass_markov_expected!(m; fwd=fwd, iter=it,
+                                       force_every=force_every, atol=cut_atol)
+
+        # -------- Logging & stopping --------
+        cur_total = total_cuts()
+        new_cuts  = cur_total - prev_total
+        prev_total = cur_total
+
+        vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
+        cur_V, _ = evaluate(vf_eval, x0)
+        ΔV       = abs(cur_V - prev_V)
+        prev_V   = cur_V
+
+        stats = (iter=it, new_cuts=new_cuts, total_cuts=cur_total,
+                 V=cur_V, ΔV=ΔV, per_stage=cuts_by_stage())
+        push!(hist, stats)
+
+        if logfn === nothing
+            @printf "iter %4d | new cuts: %2d | total: %3d | V%d[%s](x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_stage string(evaluate_ctx) cur_V ΔV
+        else
+            logfn(it, stats)
+        end
+
+        stagnant = (new_cuts == 0) ? (stagnant + 1) : 0
+        if stagnant >= patience
+            println("Early stop: no new cuts for $patience consecutive iterations.")
+            return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+        if value_tol > 0 && ΔV ≤ value_tol
+            println("Early stop: |ΔV| ≤ $value_tol.")
+            return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+    end
+
+    println("Reached max_iter without early stop.")
+    return (iters=max_iter, cuts_per_stage=cuts_by_stage(), history=hist)
+end
+
+
+#######Risk averse###########
+"""
+    run_markov_sddp_rho!(m::MarkovSDDP;
+                         x0::AbstractVector,
+                         ctx0,
+                         S::Int = 1,
+                         max_iter::Int = 1_000,
+                         patience::Int = 20,
+                         value_tol::Float64 = 0.0,
+                         evaluate_stage::Int = 1,
+                         evaluate_ctx,
+                         rng = Random.default_rng(),
+                         force_every::Int = 10,
+                         cut_atol::Float64 = 1e-8,
+                         alpha::Float64,
+                         lambda::Float64,
+                         logfn = nothing)
+
+Train a **Markov SDDP model** under the combined coherent risk measure
+
+
+    rho_{alpha,lambda}(Z) =  lambda,{E}[Z] + (1-lambda),AVaR_alpha(Z),
+
+
+applied stagewise to the scenario values generated by the stage builders.
+
+Keyword arguments:
+
+  * `x0`          – initial state vector at stage 1.
+  * `ctx0`        – initial Markov state (node key) at stage 1.
+  * `S`           – number of forward trajectories per iteration.
+  * `max_iter`    – maximum number of SDDP iterations.
+  * `patience`    – stop if no new cuts are added for this many consecutive iterations.
+  * `value_tol`   – optional tolerance on |ΔV| at the evaluation (stage,ctx); ≤ 0 disables.
+  * `evaluate_stage` – stage index at which to monitor convergence (typically 1).
+  * `evaluate_ctx`   – Markov state key at which to monitor convergence.
+  * `rng`         – RNG object used for sampling in the forward pass.
+  * `force_every` – every `force_every` iterations, force addition of a cut at each visited node
+                    (even if inactive at the current support point); ≤ 0 disables forcing.
+  * `cut_atol`    – numerical tolerance passed to the backward pass for cut activity/dominance.
+  * `alpha`       – AVaR level α ∈ [0,1); α close to 1 focuses more on tail scenarios.
+  * `lambda`      – mixing parameter λ ∈ [0,1]; λ = 1 is risk–neutral, λ = 0 is pure AVaR.
+  * `logfn`       – optional callback `logfn(it, stats::NamedTuple)`; if `nothing`, a default
+                    textual log is printed each iteration.
+
+The algorithm repeatedly:
+
+  1. Runs a Markov–aware forward pass `forward_pass_markov_online!` with `S` trajectories.
+  2. For each visited node (t, ctx) and support point xₜ, performs a risk-averse backward pass
+     `backward_pass_markov_rho!`, which:
+       * builds scenario cuts (α_ω, β_ω) for each child shock ω,
+       * evaluates scenario values v_ω = α_ω + β_ωᵀ xₜ,
+       * computes optimal AVaR dual weights via `_avar_dual_weights(ps, v_ω; alpha)`,
+       * forms combined weights w_ω = λ p_ω + (1−λ) λ_ω^{AVaR},
+       * aggregates a single cut using these weights and adds it to the appropriate
+         `ValueFn{Float64}` at stage t and Markov state ctx (if active).
+
+Stopping rules:
+
+  * **Cut stagnation:** terminate early if no new cuts are added for `patience` consecutive iterations.
+  * **Value stabilization:** if `value_tol > 0` and the change in the monitored value
+    |ΔV| ≤ `value_tol`, terminate early.
+
+Returns a `NamedTuple` with fields:
+
+  * `iters`           – number of iterations performed.
+  * `cuts_per_stage`  – vector with the total number of cuts at each stage (aggregated over Markov states).
+  * `history`         – vector of per–iteration statistics,
+                        each `stats` having fields `(iter, new_cuts, total_cuts, V, ΔV, per_stage)`.
+"""
+function run_markov_sddp_rho!(m::MarkovSDDP;
+    x0::AbstractVector,
+    ctx0,
+    K::Int,
+    children_count::AbstractVector{<:Integer},                   
+    S::Int = 1,
+    max_iter::Int = 1_000,
+    patience::Int = 20,
+    value_tol::Float64 = 0.0,
+    evaluate_stage::Int = 1,
+    evaluate_ctx,
+    rng = Random.default_rng(),
+    force_every::Int = 10,
+    cut_atol::Float64 = 1e-8,
+    alpha::Float64,
+    lambda::Float64,
+    logfn = nothing,
+    VALUE_CHECK_WINDOW::Int = 200
+)
+
+    @assert 0.0 ≤ lambda ≤ 1.0 "lambda must be in [0,1]."
+    @assert 0.0 ≤ alpha  < 1.0 "alpha must be in [0,1)."
+
+    T = m.T
+    d = m.stages[1].state_dim
+
+    # Allocate forward-pass buffers once (reused each iteration)
+    x_hist_buf   = Array{Float64,3}(undef, d, T, S)
+    ctx_hist_buf = Array{Int}(undef, T, S)
+    node_counts  = zeros(Int, T, K)
+
+
+    # Helpers that count cuts across all Markov states at each stage
+    total_cuts() = sum(
+        t -> sum(vf -> length(vf.cuts), values(m.V[t]); init = 0),
+        1:m.T;
+        init = 0,
+    )
+
+    cuts_by_stage() = [
+        sum(vf -> length(vf.cuts), values(m.V[t]); init = 0)
+        for t in 1:m.T
+    ]
+
+    prev_total = total_cuts()
+    stagnant   = 0
+
+    # initial value at evaluation (stage, ctx)
+    vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
+    prev_V, _ = evaluate(vf_eval, x0)
+    last_check_V = prev_V
+
+    hist = Vector{NamedTuple}()
+    Random.seed!(rng, 1234)
+
+    t_cum = 0.0  # cumulative runtime
+    x0_f = Vector{Float64}(x0)
+    for it in 1:max_iter
+        t_iter0 = time()
+        fill!(node_counts, 0)   # <-- IMPORTANT
+
+        # -------- Forward pass --------
+        t0 = time()
+        fwd = forward_pass_markov_online!(m;
+            S=S, x0=x0_f, ctx0=ctx0, K=K,
+            x_hist=x_hist_buf, ctx_hist=ctx_hist_buf, node_counts=node_counts
+        )
+        t_fwd = time() - t0
+
+        # -------- Backward pass --------
+        t0 = time()
+        backward_pass_markov_rho!(m; fwd=fwd, iter=it, force_every=force_every, atol=cut_atol,
+                          alpha=alpha, lambda=lambda, K=K)
+
+        t_bwd = time() - t0
+
+        # -------- Cut counts --------
+        cur_total = total_cuts()
+        new_cuts  = cur_total - prev_total
+        prev_total = cur_total
+
+        # -------- Value evaluation --------
+        t0 = time()
+        vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
+        cur_V, _ = evaluate(vf_eval, x0_f)
+        t_eval = time() - t0
+
+        # -------- Iteration time --------
+        t_iter = time() - t_iter0
+        t_cum += t_iter
+
+        ΔV     = abs(cur_V - prev_V)
+        prev_V = cur_V
+
+        # -------- Workload KPIs from THIS iteration --------
+        unique_nodes = count(>(0), node_counts)
+
+        bwd_work_units = 0
+        @inbounds for t in 1:T, z in 1:K
+            c = node_counts[t, z]
+            c == 0 && continue
+            bwd_work_units += c * children_count[z]
+        end
+        avg_children_visited = bwd_work_units / max(1, S*T)
+
+        stats = (
+            iter=it,
+            new_cuts=new_cuts,
+            total_cuts=cur_total,
+            V=cur_V,
+            ΔV=ΔV,
+            per_stage=cuts_by_stage(),
+
+            # timings
+            t_fwd=t_fwd,
+            t_bwd=t_bwd,
+            t_eval=t_eval,
+            t_iter=t_iter,
+            t_cum=t_cum,
+
+            # workload
+            unique_nodes=unique_nodes,
+            bwd_work_units=bwd_work_units,
+            avg_children_visited=avg_children_visited,
+        )
+        push!(hist, stats)
+
+        if logfn === nothing
+            if it % 10 == 0 || it == 1
+                @printf "iter %4d | new cuts: %3d | total: %5d | V=%.6f | ΔV=%.3e | t=%.3fs (fwd %.3f / bwd %.3f)\n" it new_cuts cur_total cur_V ΔV t_iter t_fwd t_bwd
+            end
+        else
+            logfn(it, stats)
+        end
+
+        stagnant = (new_cuts == 0) ? (stagnant + 1) : 0
+        if stagnant >= patience
+            println("Early stop: no new cuts for $patience consecutive iterations.")
+            return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+        end
+
+        if value_tol > 0.0 && it % VALUE_CHECK_WINDOW == 0
+            denom = max(1.0, abs(last_check_V))
+            rel_ΔV = abs(cur_V - last_check_V) / denom
+
+            if rel_ΔV ≤ value_tol
+                println("Early stop: relative |ΔV| over last $VALUE_CHECK_WINDOW iterations ≤ $value_tol.")
+                return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
+            end
+            last_check_V = cur_V
         end
     end
 
