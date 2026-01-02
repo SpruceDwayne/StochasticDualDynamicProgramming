@@ -474,24 +474,36 @@ Returns a `NamedTuple` with fields:
                         each `stats` having fields `(iter, new_cuts, total_cuts, V, ΔV, per_stage)`.
 """
 function run_markov_sddp_rho!(m::MarkovSDDP;
-                              x0::AbstractVector,
-                              ctx0,
-                              S::Int = 1,
-                              max_iter::Int = 1_000,
-                              patience::Int = 20,
-                              value_tol::Float64 = 0.0,
-                              evaluate_stage::Int = 1,
-                              evaluate_ctx,
-                              rng = Random.default_rng(),
-                              force_every::Int = 10,
-                              cut_atol::Float64 = 1e-8,
-                              alpha::Float64,
-                              lambda::Float64,
-                              logfn = nothing,
-                              VALUE_CHECK_WINDOW=200)
+    x0::AbstractVector,
+    ctx0,
+    K::Int,
+    children_count::AbstractVector{<:Integer},                   
+    S::Int = 1,
+    max_iter::Int = 1_000,
+    patience::Int = 20,
+    value_tol::Float64 = 0.0,
+    evaluate_stage::Int = 1,
+    evaluate_ctx,
+    rng = Random.default_rng(),
+    force_every::Int = 10,
+    cut_atol::Float64 = 1e-8,
+    alpha::Float64,
+    lambda::Float64,
+    logfn = nothing,
+    VALUE_CHECK_WINDOW::Int = 200
+)
 
     @assert 0.0 ≤ lambda ≤ 1.0 "lambda must be in [0,1]."
     @assert 0.0 ≤ alpha  < 1.0 "alpha must be in [0,1)."
+
+    T = m.T
+    d = m.stages[1].state_dim
+
+    # Allocate forward-pass buffers once (reused each iteration)
+    x_hist_buf   = Array{Float64,3}(undef, d, T, S)
+    ctx_hist_buf = Array{Int}(undef, T, S)
+    node_counts  = zeros(Int, T, K)
+
 
     # Helpers that count cuts across all Markov states at each stage
     total_cuts() = sum(
@@ -500,12 +512,10 @@ function run_markov_sddp_rho!(m::MarkovSDDP;
         init = 0,
     )
 
-    function cuts_by_stage()
-    [
+    cuts_by_stage() = [
         sum(vf -> length(vf.cuts), values(m.V[t]); init = 0)
         for t in 1:m.T
     ]
-end
 
     prev_total = total_cuts()
     stagnant   = 0
@@ -513,45 +523,87 @@ end
     # initial value at evaluation (stage, ctx)
     vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
     prev_V, _ = evaluate(vf_eval, x0)
-
-    # For relative improvement check over a iteration window
-    #VALUE_CHECK_WINDOW = 200
-    last_check_V = prev_V  # V at last value_tol check
+    last_check_V = prev_V
 
     hist = Vector{NamedTuple}()
+    Random.seed!(rng, 1234)
 
-    Random.seed!(rng, rand(UInt))
-
+    t_cum = 0.0  # cumulative runtime
+    x0_f = Vector{Float64}(x0)
     for it in 1:max_iter
-        # -------- Forward pass (Markov-aware) --------
-        fwd = forward_pass_markov_online!(m; S=S, x0=x0, ctx0=ctx0)
+        t_iter0 = time()
+        fill!(node_counts, 0)   # <-- IMPORTANT
 
-        # -------- Backward pass with ρ_{α,λ} --------
-        backward_pass_markov_rho!(m;
-            fwd         = fwd,
-            iter        = it,
-            force_every = force_every,
-            atol        = cut_atol,
-            alpha       = alpha,
-            lambda      = lambda,
+        # -------- Forward pass --------
+        t0 = time()
+        fwd = forward_pass_markov_online!(m;
+            S=S, x0=x0_f, ctx0=ctx0, K=K,
+            x_hist=x_hist_buf, ctx_hist=ctx_hist_buf, node_counts=node_counts
         )
+        t_fwd = time() - t0
 
-        # -------- Logging & stopping --------
+        # -------- Backward pass --------
+        t0 = time()
+        backward_pass_markov_rho!(m; fwd=fwd, iter=it, force_every=force_every, atol=cut_atol,
+                          alpha=alpha, lambda=lambda, K=K)
+
+        t_bwd = time() - t0
+
+        # -------- Cut counts --------
         cur_total = total_cuts()
         new_cuts  = cur_total - prev_total
         prev_total = cur_total
 
+        # -------- Value evaluation --------
+        t0 = time()
         vf_eval = get_V!(m, evaluate_stage, evaluate_ctx)
-        cur_V, _ = evaluate(vf_eval, x0)
-        ΔV       = abs(cur_V - prev_V)
-        prev_V   = cur_V
+        cur_V, _ = evaluate(vf_eval, x0_f)
+        t_eval = time() - t0
 
-        stats = (iter=it, new_cuts=new_cuts, total_cuts=cur_total,
-                 V=cur_V, ΔV=ΔV, per_stage=cuts_by_stage())
+        # -------- Iteration time --------
+        t_iter = time() - t_iter0
+        t_cum += t_iter
+
+        ΔV     = abs(cur_V - prev_V)
+        prev_V = cur_V
+
+        # -------- Workload KPIs from THIS iteration --------
+        unique_nodes = count(>(0), node_counts)
+
+        bwd_work_units = 0
+        @inbounds for t in 1:T, z in 1:K
+            c = node_counts[t, z]
+            c == 0 && continue
+            bwd_work_units += c * children_count[z]
+        end
+        avg_children_visited = bwd_work_units / max(1, S*T)
+
+        stats = (
+            iter=it,
+            new_cuts=new_cuts,
+            total_cuts=cur_total,
+            V=cur_V,
+            ΔV=ΔV,
+            per_stage=cuts_by_stage(),
+
+            # timings
+            t_fwd=t_fwd,
+            t_bwd=t_bwd,
+            t_eval=t_eval,
+            t_iter=t_iter,
+            t_cum=t_cum,
+
+            # workload
+            unique_nodes=unique_nodes,
+            bwd_work_units=bwd_work_units,
+            avg_children_visited=avg_children_visited,
+        )
         push!(hist, stats)
 
         if logfn === nothing
-            @printf "iter %4d | new cuts: %2d | total: %3d | ρ_{α,λ} V%d[%s](x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_stage string(evaluate_ctx) cur_V ΔV
+            if it % 10 == 0 || it == 1
+                @printf "iter %4d | new cuts: %3d | total: %5d | V=%.6f | ΔV=%.3e | t=%.3fs (fwd %.3f / bwd %.3f)\n" it new_cuts cur_total cur_V ΔV t_iter t_fwd t_bwd
+            end
         else
             logfn(it, stats)
         end
@@ -562,9 +614,6 @@ end
             return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
         end
 
-
-        # Value-based early stop:
-        # Check relative improvement only every VALUE_CHECK_WINDOW iterations
         if value_tol > 0.0 && it % VALUE_CHECK_WINDOW == 0
             denom = max(1.0, abs(last_check_V))
             rel_ΔV = abs(cur_V - last_check_V) / denom
@@ -573,8 +622,6 @@ end
                 println("Early stop: relative |ΔV| over last $VALUE_CHECK_WINDOW iterations ≤ $value_tol.")
                 return (iters=it, cuts_per_stage=cuts_by_stage(), history=hist)
             end
-
-            # Reset baseline for next window
             last_check_V = cur_V
         end
     end
@@ -582,5 +629,6 @@ end
     println("Reached max_iter without early stop.")
     return (iters=max_iter, cuts_per_stage=cuts_by_stage(), history=hist)
 end
+
 
 

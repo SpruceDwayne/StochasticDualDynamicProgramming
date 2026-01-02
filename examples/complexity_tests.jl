@@ -1,61 +1,80 @@
+###############################
+# Complexity parameter sweep script
+###############################
 using Pkg
 Pkg.activate(joinpath(@__DIR__, "..", "SDDPBAPE"))
 Pkg.instantiate()
 Pkg.precompile()
-1+1
+
 using SDDPBAPE
 using JuMP, HiGHS, Random
 using CSV, DataFrames, Statistics
-using StatsBase  # if you want random sampling
-Random.seed!(1234)
+using StatsBase
 
+Random.seed!(1234)
 
 # ============================================================
 # Load ξ_t from CSV
-#   Columns: regime; a_t_tilde; r_t_tilde; pi_year
+#   Expected columns (after normalizenames=true):
+#     :regime, :a_t_tilde, :r_t_tilde, :pi_year
 # ============================================================
 
 xi_path = joinpath(@__DIR__, "xi_file.csv")
 df = CSV.read(xi_path, DataFrame; normalizenames=true)
 rename!(df, Symbol.(names(df)))
 
+# Keep a full copy; we will rebuild a reduced df per run
+df_full = df
 
-# First get the regimes from the full file
-reg_vals = sort(unique(df.regime))        # e.g. [0, 1]
+# Identify regimes and map to Markov indices 1..K
+reg_vals = sort(unique(df_full.regime))
 const K = length(reg_vals)
-reg_index = Dict(r => i for (i, r) in enumerate(reg_vals))
-
-# Scenario reduction (optional)
-max_scen = 20
-const T_rand = 10
-
-df_small = DataFrame()
-for r in reg_vals
-    rows = df[df.regime .== r, :]
-    n = nrow(rows)
-    idx = n > max_scen ? sample(1:n, max_scen; replace=false) : 1:n
-    df_small = vcat(df_small, rows[idx, :])
-end
-df = df_small  # overwrite with reduced dataset
-
+const reg_index = Dict(r => i for (i, r) in enumerate(reg_vals))
 
 # ============================================================
-# Regimes and Markov transition matrix
+# Markov transition matrix P(z_next | z)
 # ============================================================
 
-reg_vals = sort(unique(df.regime))        # e.g. [0, 1]
-const K = length(reg_vals)
-reg_index = Dict(r => i for (i, r) in enumerate(reg_vals))
-
-# 2×2 transition matrix P(z_next | z)
 const Pz = [
-            0.74  0.26;
-            0.29  0.71;
-            ]
+    0.74  0.26;
+    0.29  0.71;
+]
 @assert size(Pz) == (K, K)
 
 # ============================================================
+# Scenario reduction helper (controls |Xi| per regime)
+# ============================================================
+
+function reduce_df_by_regime_old(df_full::DataFrame, reg_vals, max_scen::Int)
+    df_small = DataFrame()
+    for r in reg_vals
+        rows = df_full[df_full.regime .== r, :]
+        n = nrow(rows)
+        idx = n > max_scen ? sample(1:n, max_scen; replace=false) : 1:n
+        df_small = vcat(df_small, rows[idx, :])
+    end
+    return df_small
+end
+
+function reduce_df_by_regime(
+    df_full::DataFrame,
+    reg_vals,
+    max_scen::Int;
+    rng::AbstractRNG = Random.default_rng()
+)
+    df_small = DataFrame()
+    for r in reg_vals
+        rows = df_full[df_full.regime .== r, :]
+        n = nrow(rows)
+        idx = n > max_scen ? sample(rng, 1:n, max_scen; replace=false) : 1:n
+        df_small = vcat(df_small, rows[idx, :])
+    end
+    return df_small
+end
+
+# ============================================================
 # Shock type and Xi_of(z)
+#   NOTE: Xi_of closes over global `df` (which we overwrite per run)
 # ============================================================
 
 struct XiShock
@@ -66,8 +85,8 @@ struct XiShock
 end
 
 function Xi_of(z::Int)
-    # Which original regime label corresponds to Markov index z?
-    reg_label = reg_vals[z]                    # e.g. 0 or 1
+    # global df must exist
+    reg_label = reg_vals[z]
     rows = df[df.regime .== reg_label, :]
     N = nrow(rows)
     @assert N > 0 "No rows in CSV for regime $(reg_label)"
@@ -75,14 +94,12 @@ function Xi_of(z::Int)
     shocks = XiShock[]
     probs  = Float64[]
 
-    base_p = 1.0 / N   # empirical P(ξ | z)
+    base_p = 1.0 / N  # empirical P(ξ | z)
 
-    # For each possible next Markov state z_next
     for z_next in 1:K
-        Pzz = Pz[z, z_next]        # P(z_next | z)
+        Pzz = Pz[z, z_next]
         Pzz == 0.0 && continue
 
-        # For each (a,r,pi) row conditional on current regime z
         for i in 1:N
             a  = rows.a_t_tilde[i]
             rt = rows.r_t_tilde[i]
@@ -97,76 +114,54 @@ function Xi_of(z::Int)
     return shocks, probs
 end
 
+children_count = [length(first(Xi_of(z))) for z in 1:K]
+
 # ============================================================
-# Model parameters
+# Model parameters (kept fixed across complexity runs)
 # ============================================================
 
-const γ         = 1.0       # discount
-const state_dim = 5         # [w_t, l_t, c_t, ltilde_t, x_{t-1}]
+const γ         = 1.0
+const state_dim = 5  # [w, l, c, ltilde, x_prev]
 
-# Risk-neutral: weights on tracking inflation and funding
-const α = 1.0    # weight on inflation tracking slack s_t^{inf}
-const β = 1.5    # weight on funding slack s_t^{fund}
-const λ_fund = 1.0  # funding level scaling in l_t a_t - λ w_t
+const α = 1.0
+const β = 1.5
+const λ_fund = 1.0
 
-# Initial conditions: L0=1, C0=1.1 L0, W0 = 1.1 * a0 * L0
+kappa = 0.7
+kappa_inf = 0.98
+
+# Initial conditions (keep fixed for clean complexity comparisons)
 L0 = 1.0
 C0 = 0.99 * L0
-a0 = mean(df.a_t_tilde)
-W0 = 1.05 * a0 * L0
+a0_full = mean(df_full.a_t_tilde)
+W0 = 0.999* a0_full * L0 #1.05 * a0_full * L0
 
 xprev0 = 0.0
-x0_state = [W0, L0, C0, L0, xprev0]  # [w0, l0, c0, ltilde0, x_{-1}=0]
+x0_state = [W0, L0, C0, L0, xprev0]
 
 # ============================================================
 # Stage builders
 # ============================================================
-kappa=0.7
-kappa_inf = 0.98
-"""
-Stage t ≥ 1 (random).
 
-State x_state = (w_{t-1}, l_{t-1}, c_{t-1}, ltilde_{t-1}, x_{t-2})
-
-Shock ω = (a_t, r_t, π_t).
-
-Dynamics:
-  c_t      = c_{t-1} (1 + π_t)
-  ltilde_t = ltilde_{t-1} (1 + π_t)
-  l_t      = l_{t-1} + b_t
-  w_t      = w_{t-1} + c_t - l_t + x_{t-1} r_t
-  x_{t-1}  (state component 5) carried in x_state[5]
-  new exposure x_t becomes x_{t} in next state: x_next[5] = x_t
-
-Slacks:
-  s_inf  ≥ ltilde_t - l_t
-  s_fund ≥ l_t a_t - λ_fund w_t
-
-Immediate cost: α s_inf + β s_fund + continuation θ.
-"""
 function build_stage_model(t::Int,
                            vf_next::ValueFn{Float64},
                            ω::XiShock;
-                           fix_state::Vector{Float64})
+                           fix_state::AbstractVector{<:Real})
 
-    model = Model(HiGHS.Optimizer); set_silent(model)
+    model = Model(HiGHS.Optimizer)
+    set_silent(model)
 
-    # State variables at t-1
     @variable(model, x_state[1:state_dim])
-
-    # Next-state variables at t
     @variable(model, x_next[1:state_dim])
 
-    # Decision variables
-    @variable(model, b >= 0)            # bonus
-    @variable(model, x >= 0)            # new exposure x_t
+    @variable(model, b >= 0)
+    @variable(model, x >= 0)
     @variable(model, s_inf  >= 0)
     @variable(model, s_fund >= 0)
     @variable(model, θ)
 
     @constraint(model, x_state .== fix_state)
 
-    # Shorthand
     w_prev      = x_state[1]
     l_prev      = x_state[2]
     c_prev      = x_state[3]
@@ -177,23 +172,19 @@ function build_stage_model(t::Int,
     l_t      = x_next[2]
     c_t      = x_next[3]
     ltilde_t = x_next[4]
-    x_carry  = x_next[5]   # stored x_t
+    x_carry  = x_next[5]
 
-    # Dynamics
-    c_eq      = @constraint(model, c_t      == c_prev      * (1.0 +kappa* ω.pi))
+    c_eq      = @constraint(model, c_t      == c_prev      * (1.0 + kappa * ω.pi))
     ltilde_eq = @constraint(model, ltilde_t == ltilde_prev * (1.0 + ω.pi))
     l_eq      = @constraint(model, l_t      == l_prev      + b)
     w_eq      = @constraint(model, w_t      == w_prev + c_t - l_t + x_prev * ω.r)
     xcarry_eq = @constraint(model, x_carry  == x)
 
-    # Exposure limit: x_t ≤ 1.5 * w_t
     @constraint(model, x <= 1.5 * w_t)
 
-    # Slacks
-    @constraint(model, s_inf  >= ltilde_t -kappa_inf* l_t)
+    @constraint(model, s_inf  >= ltilde_t - kappa_inf * l_t)
     @constraint(model, s_fund >= l_t * ω.a - λ_fund * w_t)
 
-    # Continuation value: θ ≥ V_{t+1}(x_next)
     if isempty(vf_next.cuts)
         @constraint(model, θ >= 0)
     else
@@ -202,72 +193,49 @@ function build_stage_model(t::Int,
         end
     end
 
-    # Cost: α s_inf + β s_fund + θ
     @objective(model, Min, α * s_inf + β * s_fund + θ)
 
     misc = Dict{Symbol,Any}(
-    :x_state  => x_state,
-    :x_next   => x_next,
-    :xnext_eq => [w_eq, l_eq, c_eq, ltilde_eq, xcarry_eq],
-    :c_x      => zeros(state_dim),
-    :x_dec    => x,        # decision x_t
-    :b        => b,        # decision b_t
-    :s_inf    => s_inf,
-    :s_fund   => s_fund,
-)
-
+        :x_state => x_state,
+        :x_next  => x_next,
+        :xnext_eq => [w_eq, l_eq, c_eq, ltilde_eq, xcarry_eq],
+        :x_dec   => x,
+        :b       => b,
+        :s_inf   => s_inf,
+        :s_fund  => s_fund,
+    )
 
     return model, x_state, θ, misc
 end
 
-
-"""
-Deterministic stage 0.
-
-Here we only pick the initial exposure x_0, everything else is fixed:
-  (w0, l0, c0, ltilde0, x_{-1}=0) given in fix_state.
-
-We propagate:
-  x_next[1:4] = x_state[1:4]
-  x_next[5]   = x_0
-
-No immediate cost at t=0; we only see θ >= V_1(x_next).
-"""
 function build_stage0(t::Int,
                       vf_next::ValueFn{Float64},
                       _ω=nothing;
-                      fix_state::Vector{Float64})
+                      fix_state::AbstractVector{<:Real})
 
-    model = Model(HiGHS.Optimizer); set_silent(model)
+    model = Model(HiGHS.Optimizer)
+    set_silent(model)
 
     @variable(model, x_state[1:state_dim])
     @variable(model, x_next[1:state_dim])
-
-    @variable(model, x >= 0)  # initial exposure x_0
+    @variable(model, x >= 0)
     @variable(model, θ)
 
     @constraint(model, x_state .== fix_state)
 
-    # Shorthand
     w0      = x_state[1]
     l0      = x_state[2]
     c0      = x_state[3]
     ltilde0 = x_state[4]
-    x_prev0 = x_state[5]
 
-    # Dynamics at t=0: no return yet, only carry x_0
     w_eq0      = @constraint(model, x_next[1] == w0)
     l_eq0      = @constraint(model, x_next[2] == l0)
     c_eq0      = @constraint(model, x_next[3] == c0)
     ltilde_eq0 = @constraint(model, x_next[4] == ltilde0)
     xcarry_eq0 = @constraint(model, x_next[5] == x)
 
-    # Optional bound from your text: x_0 ≤ W_0 - a_0
-    #@constraint(model, x <= w0 - a0)
-    # And also respect leverage bound same as later: x_0 ≤ 1.5 * w0
     @constraint(model, x <= 1.5 * w0)
 
-    # Continuation value from stage 1
     if isempty(vf_next.cuts)
         @constraint(model, θ >= 0)
     else
@@ -279,31 +247,26 @@ function build_stage0(t::Int,
     @objective(model, Min, θ)
 
     misc = Dict{Symbol,Any}(
-        :x_state  => x_state,
-        :x_next   => x_next,
+        :x_state => x_state,
+        :x_next  => x_next,
         :xnext_eq => [w_eq0, l_eq0, c_eq0, ltilde_eq0, xcarry_eq0],
-        :c_x      => zeros(state_dim),
-        :x_dec    => x,    # <-- initial exposure x_0 for "logging"
+        :x_dec   => x,
     )
 
     return model, x_state, θ, misc
 end
 
-
-# Deterministic Stage wrapper (for stage 0)
 Stage_deterministic(; t, state_dim, build) = Stage(
     t,
     state_dim,
     build,
-    ctx -> nothing,          # sampler (no randomness)
-    _   -> 1.0,              # weight
-    (tt, ctx) -> (Any[nothing], [1.0]),  # children
-    (tt, ctx, _ω) -> ctx,    # next_ctx = ctx
-    ctx -> ctx               # node_key
+    ctx -> nothing,
+    _   -> 1.0,
+    (tt, ctx) -> (Any[nothing], [1.0]),
+    (tt, ctx, _ω) -> ctx,
+    ctx -> ctx
 )
 
-
-# Build Markov random Stage for t ≥ 1
 function make_markov_stage(t::Int)
     build = (tt, vf_next, ω::XiShock; fix_state=nothing) ->
         build_stage_model(tt, vf_next, ω; fix_state=fix_state)
@@ -328,130 +291,6 @@ function make_markov_stage(t::Int)
     return Stage(t, state_dim, build, sampler, weight, children, next_ctx, z -> z)
 end
 
-# ============================================================
-# Assemble stages and build MarkovSDDP model
-# ============================================================
-
-stage0 = Stage_deterministic(
-    t = 1, state_dim = state_dim,
-    build = (tt, vf_next, ω; fix_state=nothing) ->
-        build_stage0(tt, vf_next, ω; fix_state=fix_state)
-)
-
-stages_rand = [make_markov_stage(t) for t in 2:(T_rand+1)]
-stages = vcat([stage0], stages_rand)
-
-m = MarkovSDDP(stages; discount = γ)
-
-# ============================================================
-# Run risk-neutral Markov SDDP
-# ============================================================
-
-
-# pick initial regime (use the first one in reg_vals)
-z0_reg = reg_vals[1]
-z0     = reg_index[z0_reg]
-
-
-
-####Then to examine the policy we simulate it and store it as a CSV to be analysed elsewhere
-using DataFrames,CSV
-
-function simulate_policy(m::MarkovSDDP;
-                         x0::Vector{Float64},
-                         ctx0,
-                         T::Int = m.T,
-                         Nsim::Int = 100,
-                         rng = Random.default_rng())
-
-    rows = DataFrame(
-        scenario = Int[],
-        t        = Int[],
-        regime   = Int[],        # current Markov state z_t (before transition)
-        w_prev   = Float64[],
-        l_prev   = Float64[],
-        c_prev   = Float64[],
-        ltilde_prev = Float64[],
-        x_prev   = Float64[],
-        # decisions taken at stage t
-        x_dec    = Float64[],
-        b_dec    = Union{Missing,Float64}[],
-        # post-decision / post-dynamics state
-        w        = Float64[],
-        l        = Float64[],
-        c        = Float64[],
-        ltilde   = Float64[],
-        x_carry  = Float64[],    # equals x_dec
-        # shocks
-        a        = Union{Missing,Float64}[],
-        r        = Union{Missing,Float64}[],
-        pi       = Union{Missing,Float64}[],
-        # slacks
-        s_inf    = Union{Missing,Float64}[],
-        s_fund   = Union{Missing,Float64}[],
-        # diagnostics
-        FR       = Union{Missing,Float64}[],  # funding ratio at t: w_t/(a_t*l_t)
-        IR       = Union{Missing,Float64}[],  # indexation ratio at t: l_t/ltilde_t
-    )
-
-    for s in 1:Nsim
-        x_state = copy(x0)   # [w, l, c, ltilde, x_prev]
-        ctx     = ctx0       # Markov state
-
-        for t in 1:T
-            stage = m.stages[t]
-            ω = stage.sampler(ctx)  # `nothing` at stage 1 (deterministic)
-
-            vf_next = if t < m.T
-                get_V!(m, t+1, ctx)
-            else
-                ValueFn{Float64}()
-            end
-
-            model, _, _, misc = stage.build(t, vf_next, ω; fix_state = x_state)
-            optimize!(model)
-
-            x_next = value.(misc[:x_next])  # [w_t, l_t, c_t, ltilde_t, x_t]
-
-            # pre
-            w_prev, l_prev, c_prev, ltilde_prev, x_prev = x_state
-
-            # decisions
-            x_dec = x_next[5]
-            b_val = haskey(misc, :b) ? value(misc[:b]) : missing
-
-            s_inf  = haskey(misc, :s_inf)  ? value(misc[:s_inf])  : missing
-            s_fund = haskey(misc, :s_fund) ? value(misc[:s_fund]) : missing
-
-            a_val  = (ω isa XiShock) ? ω.a  : missing
-            r_val  = (ω isa XiShock) ? ω.r  : missing
-            pi_val = (ω isa XiShock) ? ω.pi : missing
-
-            # post
-            w_t, l_t, c_t, ltilde_t, x_carry = x_next
-
-            # diagnostics (only defined when we have a_t)
-            FR = (ω isa XiShock) ? (w_t / (ω.a * l_t)) : missing
-            IR = l_t / ltilde_t
-
-            push!(rows, (
-                s, t, ctx,
-                w_prev, l_prev, c_prev, ltilde_prev, x_prev,
-                x_dec, b_val,
-                w_t, l_t, c_t, ltilde_t, x_carry,
-                a_val, r_val, pi_val,
-                s_inf, s_fund,
-                FR, IR
-            ))
-
-            x_state = x_next
-            ctx     = stage.next_ctx(t, ctx, ω)
-        end
-    end
-
-    return rows
-end
-
 function build_markov_model(; T_rand::Int, state_dim::Int=5, γ::Float64=1.0)
     stage0 = Stage_deterministic(
         t = 1, state_dim = state_dim,
@@ -460,110 +299,187 @@ function build_markov_model(; T_rand::Int, state_dim::Int=5, γ::Float64=1.0)
     )
     stages_rand = [make_markov_stage(t) for t in 2:(T_rand+1)]
     stages = vcat([stage0], stages_rand)
-    return MarkovSDDP(stages; discount = γ)
+    return MarkovSDDP(stages; discount=γ)
 end
 
-function risk_neutral_expected_cost(df_sim::DataFrame; α::Float64, β::Float64, γ::Float64=1.0)
-    # stage cost only defined where slacks exist (random stages)
-    # treat missing slacks as 0 just in case
-    s_inf  = coalesce.(df_sim.s_inf,  0.0)
-    s_fund = coalesce.(df_sim.s_fund, 0.0)
+# ============================================================
+# Utilities: robust extraction from NamedTuples in res.history
+# ============================================================
 
-    stage_cost = α .* s_inf .+ β .* s_fund
+getprop(nt, sym::Symbol, default) = hasproperty(nt, sym) ? getproperty(nt, sym) : default
 
-    # discount by stage index t (your stage 1 is deterministic)
-    disc = γ .^ (df_sim.t .- 1)
+function history_to_df(hist)
+    DataFrame(
+        iter = [getprop(h, :iter, missing) for h in hist],
+        new_cuts = [getprop(h, :new_cuts, missing) for h in hist],
+        total_cuts = [getprop(h, :total_cuts, missing) for h in hist],
+        V = [getprop(h, :V, missing) for h in hist],
+        ΔV = [getprop(h, :ΔV, missing) for h in hist],
 
-    total_cost_by_row = disc .* stage_cost
+        t_fwd = [getprop(h, :t_fwd, missing) for h in hist],
+        t_bwd = [getprop(h, :t_bwd, missing) for h in hist],
+        t_eval = [getprop(h, :t_eval, missing) for h in hist],
+        t_iter = [getprop(h, :t_iter, missing) for h in hist],
+        t_cum  = [getprop(h, :t_cum, missing) for h in hist],
 
-    # Average over scenarios of (sum over t)
-    # Each scenario has multiple rows: group then sum.
-    g = groupby(DataFrame(cost=total_cost_by_row, scenario=df_sim.scenario), :scenario)
-    scenario_costs = combine(g, :cost => sum => :J).J
+        unique_nodes = [getprop(h, :unique_nodes, missing) for h in hist],
+        bwd_work_units = [getprop(h, :bwd_work_units, missing) for h in hist],
+        avg_children_visited = [getprop(h, :avg_children_visited, missing) for h in hist],
 
-    return mean(scenario_costs)
+        # per_stage is a vector; store it as a string so CSV writes cleanly
+        per_stage = [string(getprop(h, :per_stage, missing)) for h in hist],
+    )
 end
 
 
+function summarize_run(res; T_rand::Int, S::Int, max_scen::Int)
+    hist = res.history
+    hdf = history_to_df(hist)
 
+    # totals
+    t_total = sum(skipmissing(hdf.t_iter))
+    t_fwd   = sum(skipmissing(hdf.t_fwd))
+    t_bwd   = sum(skipmissing(hdf.t_bwd))
+    t_eval  = sum(skipmissing(hdf.t_eval))
 
-alpha_risk = 0.80
-#lambdas = [0.0,0.1,0.2, 0.3,0.4, 0.5,0.6,0.7, 0.8,0.9,1.0]   # pick your grid
-lambdas = [0.4, 0.5,0.6,0.7, 0.8,0.9,1.0]   
+    # distribution of iteration time
+    t_iters = collect(skipmissing(hdf.t_iter))
+    t_iter_mean = isempty(t_iters) ? missing : mean(t_iters)
+    t_iter_med  = isempty(t_iters) ? missing : median(t_iters)
+    t_iter_p90  = isempty(t_iters) ? missing : quantile(t_iters, 0.90)
 
-# initial regime
-z0_reg = reg_vals[1]
+    cuts_total = (nrow(hdf) == 0) ? missing : hdf.total_cuts[end]
+    V_final    = (nrow(hdf) == 0) ? missing : hdf.V[end]
+
+    return (
+        T_rand=T_rand,
+        S=S,
+        max_scen=max_scen,
+        iters=res.iters,
+        cuts_total=cuts_total,
+        V_final=V_final,
+        t_total=t_total,
+        t_fwd=t_fwd,
+        t_bwd=t_bwd,
+        t_eval=t_eval,
+        t_iter_mean=t_iter_mean,
+        t_iter_med=t_iter_med,
+        t_iter_p90=t_iter_p90
+    )
+end
+
+# ============================================================
+# Complexity sweep configuration
+# ============================================================
+
+# Fix risk parameters (keep constant during complexity study)
+alpha_risk  = 0.90
+lambda_risk = 0.5
+
+# Training controls (keep constant across runs)
+max_iter    = 1000
+patience    = 200
+value_tol   = 0.0025
+force_every = 10
+cut_atol    = 1e-8
+
+# Initial regime: use the first label in reg_vals
+z0_reg = reg_vals[2]
 z0     = reg_index[z0_reg]
 
-# run settings (keep smaller to be fast)
-max_iter = 1500
-patience = 100
+# Grids
+T_grid  = []#[4,6, 8, 10, 12, 15]        # random years
+S_grid  = [1,2, 5, 10, 20,40]         # forward trajectories per iteration
+Xi_grid = []#[10, 20, 30, 40]      # empirical rows per regime (max_scen)
 
-summary = DataFrame(
-    lambda_risk = Float64[],
-    iters = Int[],
-    cuts_total = Int[],
-    P_FR_T_lt_1 = Float64[],
-    P_IR_T_lt_1 = Float64[],
-    E_FR_T = Float64[],
-    E_IR_T = Float64[],
-    E_cost_RN = Float64[],    # <-- NEW: risk-neutral expected cost
-)
+# Build an experiment list varying one dimension at a time
+experiments = NamedTuple[]
 
-
-for λρ in lambdas
-    println("\n=== Solving for lambda_risk = $λρ ===")
-
-    m = build_markov_model(T_rand=T_rand, state_dim=state_dim, γ=γ)
-
-    res = run_markov_sddp_rho!(m;
-        x0             = x0_state,
-        ctx0           = z0,
-        S              = 1,
-        max_iter       = max_iter,
-        patience       = patience,
-        value_tol      = 0.005,
-        evaluate_stage = 1,
-        evaluate_ctx   = z0,
-        alpha          = alpha_risk,
-        lambda         = λρ
-    )
-
-    # include deterministic stage 1 + T_rand random stages:
-    sim_horizon = T_rand + 1
-    Random.seed!(2025)
-
-    df_sim = simulate_policy(m; x0=x0_state, ctx0=z0, T=sim_horizon, Nsim=1000)
-
-    df_T = df_sim[df_sim.t .== sim_horizon, :]
-    # FR is missing at t=1 but should be defined at terminal (random stage), so safe here
-    FR_T = skipmissing(df_T.FR)
-    IR_T = skipmissing(df_T.IR)
-
-    p_FR = mean(collect(FR_T) .< 1.0)
-    p_IR = mean(collect(IR_T) .< 1.0)
-
-    E_FR = mean(collect(FR_T))
-    E_IR = mean(collect(IR_T))
-    E_cost_RN = risk_neutral_expected_cost(df_sim; α=α, β=β, γ=γ)
-
-    cuts_total = sum(res.cuts_per_stage)
-
-    push!(summary, (
-    λρ, res.iters, cuts_total,
-    p_FR, p_IR,
-    E_FR, E_IR,
-    E_cost_RN
-))
-
-
-    # write simulation csv for plotting later
-    out_csv = "sim_paths_T10_Xi20_lambda$(round(λρ, digits=2))_alpha$(alpha_risk).csv"
-    CSV.write(out_csv, df_sim)
-
-    println("iters=$(res.iters), P(FR_T<1)=$(round(p_FR, digits=4)), P(IR_T<1)=$(round(p_IR, digits=4))")
+# (1) vary T, keep S and Xi fixed
+S_fix = 10
+Xi_fix = 10
+for Tt in T_grid
+    push!(experiments, (T_rand=Tt, S=S_fix, max_scen=Xi_fix, tag="varyT"))
 end
 
-CSV.write("risk_aversion_sweep_summary_alpha08.csv", summary)
-println("\nWrote risk_aversion_sweep_summary.csv")
+# (2) vary S, keep T and Xi fixed
+T_fix = 8
+Xi_fix2 = 20
+for Ss in S_grid
+    push!(experiments, (T_rand=T_fix, S=Ss, max_scen=Xi_fix2, tag="varyS"))
+end
 
+# (3) vary Xi, keep T and S fixed
+T_fix2 = 2#8
+S_fix2 = 1
+for Xx in Xi_grid
+    push!(experiments, (T_rand=T_fix2, S=S_fix2, max_scen=Xx, tag="varyXi"))
+end
+
+# Output directory
+outdir = joinpath(@__DIR__, "results_complexity")
+mkpath(outdir)
+
+summary_rows = NamedTuple[]
+
+# ============================================================
+# Run sweep
+# ============================================================
+
+for (run_id, cfg) in enumerate(experiments)
+    Tt = cfg.T_rand
+    Ss = cfg.S
+    Xx = cfg.max_scen
+    tag = cfg.tag
+
+    println("\n=== Run $run_id / $(length(experiments)) [$tag] | T=$Tt, S=$Ss, Xi_per_regime=$Xx ===")
+
+    # Rebuild reduced dataset (controls |Xi| per regime)
+    #global df = reduce_df_by_regime(df_full, reg_vals, Xx)
+    global df = reduce_df_by_regime(df_full, reg_vals, Xx; rng=Random.seed!(1234))
+    Random.seed!(1234)
+
+    # Build model with T_rand stages (plus deterministic stage 0 = stage index 1)
+    m = build_markov_model(T_rand=Tt, state_dim=state_dim, γ=γ)
+
+    # Train with your timing-enabled run_markov_sddp_rho! (assumed already defined/loaded)
+    K = 2
+    res = run_markov_sddp_rho!(m;
+        x0=x0_state,
+        ctx0=z0,
+        K=K,
+        children_count=children_count,
+        S=Ss,
+        max_iter=max_iter,
+        patience=10+div(200,Ss),
+        value_tol=value_tol,
+        evaluate_stage=1,
+        evaluate_ctx=z0,
+        force_every=force_every,
+        cut_atol=cut_atol,
+        alpha=alpha_risk,
+        lambda=lambda_risk,
+        VALUE_CHECK_WINDOW=10+div(200,Ss)
+    )
+
+    # Save per-iteration history
+    hist_df = history_to_df(res.history)
+    hist_path = joinpath(outdir, "hist_$(tag)_T$(Tt)_S$(Ss)_Xi$(Xx).csv")
+    CSV.write(hist_path, hist_df)
+
+    # Save one-line summary
+    push!(summary_rows, merge(summarize_run(res; T_rand=Tt, S=Ss, max_scen=Xx), (tag=tag,)))
+
+    # Print quick KPI
+    t_total = sum(skipmissing(hist_df.t_iter))
+    cuts_total = hist_df.total_cuts[end]
+    println("iters=$(res.iters) | cuts=$(cuts_total) | total time=$(round(t_total, digits=2))s | wrote $(basename(hist_path))")
+end
+
+summary_df = DataFrame(summary_rows)
+summary_path = joinpath(outdir, "complexity_summary.csv")
+CSV.write(summary_path, summary_df)
+
+println("\nDone.")
+println("Wrote: $(summary_path)")
+println("Wrote: $(length(experiments)) history CSV files in $(outdir)")
