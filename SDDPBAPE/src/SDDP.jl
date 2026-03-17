@@ -154,7 +154,25 @@ struct OmegaStageData{T}
     h::Vector{T}
 end
 
+# Import JuMP for model caching
+import JuMP
 
+"""
+Cache entry for a single (stage, markov_state) pair.
+Stores the JuMP model and variable references for recycling across iterations.
+"""
+mutable struct ModelCache{T}
+    model::Union{Nothing, JuMP.Model}
+    x_state::Union{Nothing, Vector{JuMP.VariableRef}}
+    x_next::Union{Nothing, Vector{JuMP.VariableRef}}
+    z_vars::Union{Nothing, Vector{JuMP.VariableRef}}   # SDDiP: continuous copy of parent binary state
+    θ::Union{Nothing, JuMP.VariableRef}
+    misc::Union{Nothing, Dict{Symbol, Any}}
+    last_cut_count::Int
+    epigraph_constraints::Vector{JuMP.ConstraintRef}
+    state_fixed::Bool
+end
+ModelCache{T}() where {T} = ModelCache{T}(nothing, nothing, nothing, nothing, nothing, nothing, 0, JuMP.ConstraintRef[], false)
 
 "Algorithm container."
 mutable struct SDDP
@@ -162,12 +180,14 @@ mutable struct SDDP
     V::Vector{ValueFn{Float64}}              # V[1..T]
     T::Int
     γ::Float64
+    model_cache::Vector{Dict{Any, ModelCache{Float64}}}  # Model cache per stage
 end
 
 function SDDP(stages::Vector{Stage}; discount::Float64=1.0)
     T = length(stages)
     V = [ValueFn{Float64}() for _ in 1:T]
-    SDDP(stages, V, T, discount)
+    cache = [Dict{Any, ModelCache{Float64}}() for _ in 1:T]
+    SDDP(stages, V, T, discount, cache)
 end
 
 
@@ -304,12 +324,14 @@ mutable struct MarkovSDDP
     V::Vector{Dict{Any, ValueFn{Float64}}}
     T::Int
     γ::Float64
+    model_cache::Vector{Dict{Any, ModelCache{Float64}}}  # Model cache per (stage, markov_state)
 end
 
 function MarkovSDDP(stages::Vector{Stage}; discount::Float64 = 1.0)
     T = length(stages)
     V = [Dict{Any, ValueFn{Float64}}() for _ in 1:T]
-    MarkovSDDP(stages, V, T, discount)
+    cache = [Dict{Any, ModelCache{Float64}}() for _ in 1:T]
+    MarkovSDDP(stages, V, T, discount, cache)
 end
 
 function get_V!(m::MarkovSDDP, t::Int, ctx_key)
@@ -361,7 +383,7 @@ function run_markov_sddp!(m::MarkovSDDP;
 
     for it in 1:max_iter
         # -------- Forward pass (Markov-aware) --------
-        fwd = forward_pass_markov_online!(m; S=S, x0=x0, ctx0=ctx0)
+        fwd = forward_pass_markov_online_old!(m; S=S, x0=x0, ctx0=ctx0)
 
         # -------- Backward pass (Markov expected cuts) --------
         backward_pass_markov_expected!(m; fwd=fwd, iter=it,
