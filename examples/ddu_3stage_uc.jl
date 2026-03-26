@@ -60,7 +60,7 @@ function build_stage1_3s(t, vf_next, ω; fix_state)
     @variable(model, x1, Bin)
     @variable(model, u1, Bin)
     @variable(model, g1 >= 0); @variable(model, shed1 >= 0)
-    @variable(model, θ >= -1e8)
+    @variable(model, θ >= 0)
     d1 = 6.0
     @constraint(model, g1 + shed1 == d1)
     @constraint(model, g1 <= Gmax * x1)
@@ -89,7 +89,7 @@ function build_stage2_3s(t, vf_next, ω; fix_state)
     @constraint(model, g2 + shed2 == d2)
     @constraint(model, g2 <= Gmax * x2)
     @constraint(model, u2 >= x2 - z2)
-    @variable(model, θ >= -1e8)
+    @variable(model, θ >= 0)
     @variable(model, ind1, Bin); @variable(model, ind2, Bin)
     @constraint(model, ind1 + ind2 == 1)
     @constraint(model, ind2 == x2)
@@ -182,7 +182,7 @@ m_3s = DDUSDDP(
 )
 
 x0_3s = [0.0]
-config_3s = SDDiPConfig(cut_type = :SB)
+config_3s = SDDiPConfig(cut_type = :lagrangian, burnin_iters = 20, burnin_cut_type = :IO)
 
 println("="^70)
 println("3-Stage DDU Unit Commitment Example")
@@ -199,8 +199,6 @@ result = run_ddu_sddip!(m_3s;
     patience    = 10,
     force_every = 1,
     cut_atol    = 0.0,
-    evaluate_stage = 1,
-    evaluate_δ     = 1,
 )
 
 println("\nConverged after $(result.iters) iterations.")

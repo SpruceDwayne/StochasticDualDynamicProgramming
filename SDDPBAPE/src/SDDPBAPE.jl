@@ -16,7 +16,7 @@ include("SDDiP.jl")                  # SDDiPConfig, solve_lagrangian_dual!, comp
 include("DDU.jl")                    # DDURegion, DDUModelCache, DDUSDDP, DDUForwardRecord,
                                      # get_V_ddu!, get_or_build_ddu_model!,
                                      # forward_pass_ddu_online!, backward_pass_ddu_sddip!,
-                                     # run_ddu_sddip!
+                                     # compute_ddu_lb!, run_ddu_sddip!
 
 
 # Example helper (optional)
@@ -39,14 +39,14 @@ export Cut, ValueFn, Stage, SDDP, MarkovSDDP,
        # Drivers (SDDP)
        run_sddp!, run_markov_sddp!, run_markov_sddp_rho!,
        # SDDiP
-       SDDiPConfig, solve_lagrangian_dual!, compute_sddip_cut!,
-       backward_pass_sddip!, backward_pass_markov_sddip!,
+       LevelMethodConfig, SDDiPConfig, solve_lagrangian_dual!, solve_lagrangian_dual_level!,
+       compute_sddip_cut!, backward_pass_sddip!, backward_pass_markov_sddip!,
        run_sddip!, run_markov_sddip!, binarize,
        # DDU
        DDURegion, DDUModelCache, DDUSDDP, DDUForwardRecord,
        get_V_ddu!, get_or_build_ddu_model!,
        forward_pass_ddu_online!, backward_pass_ddu_sddip!,
-       run_ddu_sddip!, _read_active_region
+       compute_ddu_lb!, run_ddu_sddip!, _read_active_region
 
 end # module
 

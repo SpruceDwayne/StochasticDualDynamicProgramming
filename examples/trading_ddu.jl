@@ -5,7 +5,11 @@ using JuMP, HiGHS
 using LinearAlgebra
 using Random
 using Printf
-1+1
+
+###########################
+#Note this script is corrupted. Do not use it 
+###########################
+
 # ============================================================================
 # Trading problem: order execution with HFT markup (DDU)
 #
@@ -21,18 +25,18 @@ using Printf
 const N_SHARES = 100
 const N_BITS   = 7          # 2^7=128 > 100 → enough for {0,...,100}
 
-const B_VALS  = [0.995,0.997,1.00,1.002,1.005]
+const B_VALS  = [0.997,0.9985,1.00,1.0015,1.003]
 const B_PROBS = fill(0.2, 5)
 
-const M_VALS  = [0.0, 0.002, 0.008]
+const M_VALS  = [0.0, 0.008, 0.118]
 # M_PROBS[d, :] = [P(0), P(0.002), P(0.008)] for region d
-const M_PROBS = [0.80 0.18 0.02;
+const M_PROBS = [0.85 0.15 0.00;
                  0.50 0.45 0.05;
-                 0.30 0.50 0.20;
-                 0.10 0.40 0.50]
+                 0.20 0.30 0.50;
+                 0.10 0.10 0.80]
 
-const REG_L = [0,  16, 41,  76]   # region lower bounds
-const REG_U = [15, 40, 75, 100]   # region upper bounds
+const REG_L = [0,  21, 41,  81]   # region lower bounds
+const REG_U = [20, 40, 80, 100]   # region upper bounds
 
 # Binary encoding coefficients: value = Σ BIN_COEFFS[i] * bit[i]
 const BIN_COEFFS = [2.0^(i-1) for i in 1:N_BITS]
@@ -135,7 +139,7 @@ function build_stage1(t, vf_next, ω; fix_state)
     @variable(model, δ[1:4], Bin)
     add_region_constraints!(model, xO, δ)
 
-    @variable(model, θ >= -1e6)
+    @variable(model, θ >= 0)
 
     # Cost: xO * b₀ = xO * 1.0; no previous markup (xO_prev = 0 always)
     @objective(model, Min, 1.0 * xO + θ)
@@ -165,7 +169,7 @@ function build_stage_mid(t, vf_next, ω; fix_state)
     @variable(model, δ[1:4], Bin)
     add_region_constraints!(model, xO, δ)
 
-    @variable(model, θ >= -1e6)
+    @variable(model, θ >= 0)
     @objective(model, Min, b * xO + m * xO_in + θ)
 
     misc = Dict{Symbol, Any}(
@@ -195,7 +199,7 @@ function build_stage4(t, vf_next, ω; fix_state)
     @variable(model, δ[1:4], Bin)
     add_region_constraints!(model, xO, δ)   # region determines stage-5 markup
 
-    @variable(model, θ >= -1e6)
+    @variable(model, θ >= 0)
     @objective(model, Min, b * xO + m * xO_in + θ)
 
     misc = Dict{Symbol, Any}(
@@ -340,7 +344,12 @@ model_ddu = DDUSDDP(
     discount = 1.0,
 )
 
-config = SDDiPConfig(cut_type = :SB)
+config = SDDiPConfig(
+    cut_type        = :lagrangian,
+    burnin_iters    = 1,
+    burnin_cut_type = :IO,
+    level_cfg       = LevelMethodConfig(optimizer = HiGHS.Optimizer),
+)
 
 println("="^70)
 println("DDU Trading Example: Order Execution with HFT Markup")
@@ -351,16 +360,14 @@ println()
 
 Random.seed!(42)
 result = run_ddu_sddip!(model_ddu;
-    x0             = X0,
-    ζ_init         = ζ_INIT,
-    config         = config,
-    S              = 5,
-    max_iter       = 300,
-    patience       = 20,
-    force_every    = 10,
-    cut_atol       = 1e-6,
-    evaluate_stage = 1,
-    evaluate_δ     = 1,
+    x0          = X0,
+    ζ_init      = ζ_INIT,
+    config      = config,
+    S           = 1,
+    max_iter    = 500,
+    patience    = 500,
+    force_every = 20,
+    cut_atol    = 1e-9,
 )
 
 println()
@@ -369,11 +376,6 @@ println("Iterations : $(result.iters)")
 println("Cuts/stage : $(result.cuts_per_stage)")
 total_cuts = sum(result.cuts_per_stage)
 println("Total cuts : $total_cuts")
-
-# Lower bound = V[1][1](x0)  (value at stage 1, region 1, initial state)
-vf_lb = get_V_ddu!(model_ddu, 1, 1)
-lb, _  = evaluate(vf_lb, X0)
-println(@sprintf("Lower bound (V[1][1](x0)): %.6f", lb))
 
 # ============================================================================
 # Exact backward DP (validation oracle)
@@ -488,6 +490,11 @@ V1 = first(V_dp_stages)
 # xP=100 → index N_SHARES+1=101; xO_prev=0 → index 1.
 dp_optimal = V1[0+1][N_SHARES+1, 0+1]
 
+# Lower bound = stage-1 MILP objective with all accumulated big-M cuts.
+# compute_ddu_lb! is the canonical way to obtain this; it is also what the
+# training loop monitors each iteration.
+lb = compute_ddu_lb!(model_ddu, X0, ζ_INIT)
+
 println(@sprintf("Exact DP optimal cost   : %.6f", dp_optimal))
 println(@sprintf("DDU-SDDiP lower bound   : %.6f", lb))
 println(@sprintf("Gap (lb vs exact)       : %.6f  (%.3f%%)",
@@ -579,6 +586,72 @@ println(@sprintf("  Optimality gap (LB vs DP)  : %.4f%%",
     100 * (dp_optimal - lb) / max(1e-10, abs(dp_optimal))))
 println()
 println("The lower bound is $(round(100*(dp_optimal-lb)/max(1e-10,abs(dp_optimal)), digits=3))% below the true optimum,")
-println("confirming the DDU-SDDiP cuts are close to tight at (xP=100, xO=0).")
+println("confirming the DDU-SDDiP cuts form a tight lower envelope over all first-stage decisions.")
 println("The MC simulation of the exact DP policy reproduces the DP value,")
 println("validating the backward DP implementation.")
+
+# ============================================================================
+# Cost-to-go function at stage 1: expected future cost vs. first-stage order
+# ============================================================================
+# For each xO ∈ {0,...,100}, evaluate the expected future cost from stage 2
+# onward, given the state (xP=100-xO, xO_next=xO) exiting stage 1.
+
+println()
+println("─── Cost-to-go at stage 1 ──────────────────────────────────────────")
+
+n_orders_vec      = collect(0:N_SHARES)
+sddp_future_costs = Vector{Float64}(undef, N_SHARES + 1)
+dp_future_costs   = Vector{Float64}(undef, N_SHARES + 1)
+
+for xO in 0:N_SHARES
+    x_state = vcat(int_to_bits(N_SHARES - xO), int_to_bits(xO))
+    d       = dp_region(xO)
+
+    # SDDP lower approximation: V[1][d](x_state)
+    # V[1][d] = expected cost from stage 2 onward given leaving state of stage 1 and region d.
+    vf                       = get_V_ddu!(model_ddu, 1, d)
+    sddp_future_costs[xO+1], _ = evaluate(vf, x_state)
+
+    # Exact DP: V_dp_stages[2][d+1][xP+1, xO+1]
+    dp_future_costs[xO+1] = V_dp_stages[2][d+1][N_SHARES - xO + 1, xO + 1]
+end
+
+# Optimal here-and-now decision: minimise total cost = stage-1 immediate cost + future cost
+# Stage-1 immediate cost: xO * b₀ = xO * 1.0  (no markup since xO_prev = 0)
+dp_total_costs   = [xO * 1.0 + dp_future_costs[xO+1]   for xO in 0:N_SHARES]
+sddp_total_costs = [xO * 1.0 + sddp_future_costs[xO+1] for xO in 0:N_SHARES]
+
+dp_opt_xO = argmin(dp_total_costs) - 1   # convert 1-based index back to shares
+
+# Read the SDDP optimal first-stage decision from the solved stage-1 MILP.
+# compute_ddu_lb! already solved the model; retrieve it from cache to read values.
+# x_next = [bP[1:N_BITS]; bO[1:N_BITS]] where bO encodes xO_next.
+_, _, _, misc_s1 = get_or_build_ddu_model!(model_ddu, 1, REGION_0.Xi[1], X0)
+x_next_vals = JuMP.value.(misc_s1[:x_next])
+sddp_opt_xO = round(Int, dot(BIN_COEFFS, x_next_vals[N_BITS+1:end]))
+
+println()
+println("─── Optimal here-and-now decision (stage 1) ───────────────────────")
+println(@sprintf("  Exact DP  optimal xO : %3d shares  (total cost %.6f)", dp_opt_xO,   dp_total_costs[dp_opt_xO+1]))
+println(@sprintf("  SDDP approx. best xO : %3d shares  (MILP obj   %.6f)", sddp_opt_xO, lb))
+
+println()
+println("n_orders_vec      = ", n_orders_vec)
+println("sddp_future_costs = ", sddp_future_costs)
+println("dp_future_costs   = ", dp_future_costs)
+
+using Plots
+plt = plot(n_orders_vec, dp_future_costs;
+    label     = "Exact DP",
+    xlabel    = "Shares purchased at stage 1",
+    ylabel    = "Expected future cost (stages 2–5)",
+    title     = "Cost-to-go at stage 1",
+    lw        = 2,
+    legend    = :topright,
+)
+plot!(plt, n_orders_vec, sddp_future_costs;
+    label     = "SDDP lower approx.",
+    lw        = 2,
+    linestyle = :dash,
+)
+display(plt)

@@ -60,7 +60,7 @@ function build_stage1_ddu(t, vf_next, ω; fix_state)
     @variable(model, u1, Bin)
     @variable(model, g1  >= 0)
     @variable(model, shed1 >= 0)
-    @variable(model, θ >= -1e7)    # continuation (big-M cuts added externally)
+    @variable(model, θ >= 0)       # continuation (big-M cuts added externally)
 
     # Stage-1 has a fixed deterministic demand of 6 (ω is dummy/nothing)
     d1 = 6.0
@@ -167,11 +167,11 @@ regions_stage2 = DDURegion[]
 m = DDUSDDP(
     [stage1, stage2],
     [regions_stage1, regions_stage2];
-    M_big = 500.0,   # safely above max stage-2 cost (~100*9 = 900 minus min ≈ 4.5)
+    M_big = 2000.0,  # must exceed max cut value ≈ max stage-2 cost (~100*9=900); lb(θ)=0
 )
 x0 = [0.0]
 
-config = SDDiPConfig(cut_type = :SB)
+config = SDDiPConfig(cut_type = :lagrangian, burnin_iters = 10, burnin_cut_type = :IO)
 
 println("="^70)
 println("DDU Smoke Test: 2-Stage Binary UC with Decision-Dependent Demand")
@@ -186,7 +186,7 @@ println("\n--- Test 1: DDUSDDP construction ---")
 @assert length(m.regions[2]) == 0              "stage 2 should have 0 regions"
 @assert isempty(m.V[1])                        "V[1] should start empty"
 @assert isempty(m.V[2])                        "V[2] should start empty"
-@assert m.M_big == 500.0                       "M_big should be 500.0"
+@assert m.M_big == 2000.0                      "M_big should be 2000.0"
 println("  PASS: DDUSDDP constructed correctly")
 
 # ============================================================================
@@ -348,8 +348,6 @@ result = run_ddu_sddip!(m3;
     patience    = 10,
     force_every = 1,
     cut_atol    = 0.0,
-    evaluate_stage = 1,
-    evaluate_δ     = 1,
 )
 @assert result.iters >= 1                              "should run at least 1 iteration"
 @assert sum(result.cuts_per_stage) >= 1               "should generate at least 1 cut total"
@@ -411,8 +409,6 @@ result_multi = run_ddu_sddip!(m_multi;
     patience    = 20,   # run all 20 iterations
     force_every = 1,
     cut_atol    = 0.0,
-    evaluate_stage = 1,
-    evaluate_δ     = 1,
 )
 
 # At least one region at stage 1 must have accumulated cuts

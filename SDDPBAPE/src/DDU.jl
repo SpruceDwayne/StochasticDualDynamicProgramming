@@ -618,20 +618,50 @@ end
 # ============================================================================
 
 """
+    compute_ddu_lb!(m::DDUSDDP, x0, ζ_init) -> Float64
+
+Compute the DDU-SDDiP lower bound: the optimal value of the stage-1 MILP
+with all currently accumulated big-M cuts.
+
+This is the direct analogue of the stage-1 LP lower bound in standard SDDP.
+Because the stage-1 MILP optimises jointly over all outgoing regions (via
+the binary δ indicators and big-M cuts from every V[1][d]), it correctly
+accounts for all regions that could be active at the optimum — not just one
+pre-selected region.
+
+The model is retrieved from (or built into) the DDU cache, so the call is
+cheap after the first build.
+"""
+function compute_ddu_lb!(m::DDUSDDP, x0::AbstractVector{<:Real}, ζ_init::Int)
+    stg = m.stages[1]
+    ω1  = stg.sampler(ζ_init)
+    model, _, _, _ = get_or_build_ddu_model!(m, 1, ω1, collect(Float64, x0))
+    JuMP.optimize!(model)
+    status = JuMP.termination_status(model)
+    status == MOI.OPTIMAL || @warn "compute_ddu_lb!: stage-1 solver status = $status"
+    return JuMP.objective_value(model)
+end
+
+"""
     run_ddu_sddip!(m::DDUSDDP; x0, ζ_init, config, S, max_iter, patience,
-                   value_tol, evaluate_stage, evaluate_δ, rng,
-                   force_every, cut_atol, logfn) -> NamedTuple
+                   lb_tol, rng, force_every, cut_atol, logfn) -> NamedTuple
 
 DDU SDDiP training loop.
 
 Keyword arguments mirror run_sddip! / run_markov_sddip!.
 
-- `ζ_init`       : incoming distribution context at stage 1 (Int, required)
-- `evaluate_stage`: stage at which to monitor V for convergence (default 1)
-- `evaluate_δ`   : outgoing region id at evaluate_stage used for monitoring
+- `ζ_init`    : incoming distribution context at stage 1 (Int, required)
+- `lb_tol`    : stop early if the lower bound improves by less than this
+                between consecutive iterations (analogous to `value_tol` in
+                standard SDDP); 0.0 disables this check.
+
+Convergence monitoring uses the **stage-1 MILP lower bound** (via
+`compute_ddu_lb!`) — the direct analogue of the stage-1 LP bound in standard
+SDDP.  This integrates all regions through the joint big-M optimisation and
+does not require pre-selecting a single region or state to track.
 
 Cut counting aggregates across all stages and all regions.
-Stopping rules: cut stagnation (patience) and optional value tolerance.
+Stopping rules: lower-bound stagnation (patience) and optional lb_tol.
 """
 function run_ddu_sddip!(
     m::DDUSDDP;
@@ -641,9 +671,7 @@ function run_ddu_sddip!(
     S::Int                = 1,
     max_iter::Int         = 1_000,
     patience::Int         = 20,
-    value_tol::Float64    = 0.0,
-    evaluate_stage::Int   = 1,
-    evaluate_δ::Int,
+    lb_tol::Float64       = 0.0,
     rng                   = Random.default_rng(),
     force_every::Int      = 10,
     cut_atol::Float64     = 1e-8,
@@ -661,32 +689,35 @@ function run_ddu_sddip!(
     prev_total = total_cuts()
     stagnant   = 0
     x0f        = collect(Float64, x0)
-    vf_eval    = get_V_ddu!(m, evaluate_stage, evaluate_δ)
-    prev_V, _  = evaluate(vf_eval, x0f)
+    prev_lb    = compute_ddu_lb!(m, x0f, ζ_init)
     hist       = Vector{NamedTuple}()
 
     Random.seed!(rng, rand(UInt))
 
     for it in 1:max_iter
+        cfg_it = _active_config(config, it)
         fwd = forward_pass_ddu_online!(m; S = S, x0 = x0f, ζ_init = ζ_init)
-        backward_pass_ddu_sddip!(m; fwd = fwd, config = config, iter = it,
+        backward_pass_ddu_sddip!(m; fwd = fwd, config = cfg_it, iter = it,
                                   force_every = force_every, atol = cut_atol)
 
         cur_total = total_cuts()
         new_cuts  = cur_total - prev_total
         prev_total = cur_total
 
-        vf_eval = get_V_ddu!(m, evaluate_stage, evaluate_δ)
-        cur_V, _ = evaluate(vf_eval, x0f)
-        ΔV        = abs(cur_V - prev_V)
-        prev_V    = cur_V
+        # Lower bound: stage-1 MILP objective with all current cuts.
+        # Analogous to the stage-1 LP bound in standard SDDP.
+        cur_lb = compute_ddu_lb!(m, x0f, ζ_init)
+        Δlb    = cur_lb - prev_lb
+        prev_lb = cur_lb
 
         stats = (iter = it, new_cuts = new_cuts, total_cuts = cur_total,
-                 V = cur_V, ΔV = ΔV, per_stage = cuts_by_stage())
+                 lb = cur_lb, Δlb = Δlb, per_stage = cuts_by_stage(),
+                 phase = it <= config.burnin_iters ? :burnin : :main)
         push!(hist, stats)
 
+        phase_tag = it <= config.burnin_iters ? "[SB burn-in] " : ""
         if logfn === nothing
-            @printf "iter %4d | new cuts: %2d | total: %3d | V[%d][%d](x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_stage evaluate_δ cur_V ΔV
+            @printf "iter %4d | %snew cuts: %2d | total: %3d | LB=%.6f | ΔLB=%.3e\n" it phase_tag new_cuts cur_total cur_lb Δlb
         else
             logfn(it, stats)
         end
@@ -694,14 +725,17 @@ function run_ddu_sddip!(
         stagnant = (new_cuts == 0) ? (stagnant + 1) : 0
         if stagnant >= patience
             println("DDU early stop: no new cuts for $patience consecutive iterations.")
-            return (iters = it, cuts_per_stage = cuts_by_stage(), history = hist)
+            return (iters = it, cuts_per_stage = cuts_by_stage(), history = hist,
+                    lb = cur_lb)
         end
-        if value_tol > 0 && ΔV ≤ value_tol
-            println("DDU early stop: |ΔV| ≤ $value_tol.")
-            return (iters = it, cuts_per_stage = cuts_by_stage(), history = hist)
+        if lb_tol > 0 && abs(Δlb) ≤ lb_tol
+            println("DDU early stop: |ΔLB| ≤ $lb_tol.")
+            return (iters = it, cuts_per_stage = cuts_by_stage(), history = hist,
+                    lb = cur_lb)
         end
     end
 
     println("DDU reached max_iter without early stop.")
-    return (iters = max_iter, cuts_per_stage = cuts_by_stage(), history = hist)
+    return (iters = max_iter, cuts_per_stage = cuts_by_stage(), history = hist,
+            lb = prev_lb)
 end

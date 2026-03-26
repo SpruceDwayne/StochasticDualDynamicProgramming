@@ -7,6 +7,43 @@ using Printf
 # ============================================================================
 
 """
+    LevelMethodConfig
+
+Configuration for the level-method Lagrangian dual solver.
+
+Fields:
+- `alpha`     – level parameter α ∈ (0,1); target level = α·LB + (1-α)·UB (default 0.5)
+- `box_M`     – half-width of box constraint on dual variables: π ∈ [-M,M]^d (default 1e3)
+- `optimizer` – LP/QP solver factory (e.g. `HiGHS.Optimizer`); must support quadratic objectives
+
+Example:
+```julia
+using HiGHS
+LevelMethodConfig(optimizer = HiGHS.Optimizer)
+LevelMethodConfig(alpha = 0.3, box_M = 500.0, optimizer = HiGHS.Optimizer)
+```
+"""
+struct LevelMethodConfig
+    alpha    ::Float64
+    box_M    ::Float64
+    optimizer          # Any — optimizer constructor (e.g. HiGHS.Optimizer)
+end
+
+function LevelMethodConfig(;
+    alpha    ::Float64 = 0.5,
+    box_M    ::Float64 = 1e3,
+    optimizer          = nothing,
+)
+    optimizer === nothing && error(
+        "LevelMethodConfig: `optimizer` is required. " *
+        "Pass e.g. `optimizer = HiGHS.Optimizer`."
+    )
+    @assert 0.0 < alpha < 1.0 "alpha must be in (0,1); got $alpha"
+    @assert box_M > 0.0       "box_M must be positive; got $box_M"
+    LevelMethodConfig(alpha, box_M, optimizer)
+end
+
+"""
     SDDiPConfig
 
 Configuration for the SDDiP algorithm.
@@ -16,11 +53,28 @@ Fields:
     * `:SB`         Strengthened Benders (one Lagrangian solve with π_LP; valid & finite)
     * `:lagrangian` Full Lagrangian dual via subgradient (valid, tight & finite)
     * `:IO`         Integer Optimality cut (tight only at evaluated point)
-    * `:SB_IO`      Both SB and IO cuts per backward step 
+    * `:SB_IO`      Both SB and IO cuts per backward step
 - `lag_tol`        – subgradient convergence tolerance (default 1e-4)
 - `lag_max_iter`   – max subgradient iterations per child (default 200)
 - `step_size_init` – initial subgradient step size (default 1.0)
 - `step_decay`     – multiplicative step-size decay per iteration (default 0.95)
+- `burnin_iters`     – number of cheap burn-in iterations before switching to
+                       `cut_type` (default 0 = no burn-in). Useful when `cut_type`
+                       is `:lagrangian`: burn-in cuts drive the lower bound up fast;
+                       the Lagrangian phase then tightens the approximation.
+- `burnin_cut_type`  – cut type used during burn-in (default `:IO`).
+                       `:IO` is preferred over `:SB` for problems with big-M
+                       formulations because `:SB` relies on LP duals that are near
+                       zero in big-M relaxations, producing trivially weak cuts.
+- `level_cfg`        – if `nothing` (default), use plain subgradient ascent for
+                       Lagrangian duals; if a `LevelMethodConfig`, use the level
+                       method instead. Only affects `cut_type = :lagrangian`.
+
+Example — switching to the level method:
+```julia
+using HiGHS
+SDDiPConfig(cut_type = :lagrangian, level_cfg = LevelMethodConfig(optimizer = HiGHS.Optimizer))
+```
 """
 struct SDDiPConfig
     cut_type::Symbol
@@ -28,18 +82,38 @@ struct SDDiPConfig
     lag_max_iter::Int
     step_size_init::Float64
     step_decay::Float64
+    burnin_iters::Int
+    burnin_cut_type::Symbol
+    level_cfg::Union{Nothing, LevelMethodConfig}
 end
 
 function SDDiPConfig(;
-    cut_type::Symbol      = :lagrangian,#SB,
-    lag_tol::Float64      = 1e-4,
-    lag_max_iter::Int     = 200,
+    cut_type::Symbol        = :lagrangian,
+    lag_tol::Float64        = 1e-4,
+    lag_max_iter::Int       = 200,
     step_size_init::Float64 = 1.0,
-    step_decay::Float64   = 0.95,
+    step_decay::Float64     = 0.95,
+    burnin_iters::Int       = 0,
+    burnin_cut_type::Symbol = :IO,
+    level_cfg::Union{Nothing, LevelMethodConfig} = nothing,
 )
-    @assert cut_type in (:SB, :lagrangian, :IO, :SB_IO) "cut_type must be one of :SB, :lagrangian, :IO, :SB_IO; got :$cut_type"
-    SDDiPConfig(cut_type, lag_tol, lag_max_iter, step_size_init, step_decay)
+    valid = (:SB, :lagrangian, :IO, :SB_IO)
+    @assert cut_type        in valid "cut_type must be one of $valid; got :$cut_type"
+    @assert burnin_cut_type in valid "burnin_cut_type must be one of $valid; got :$burnin_cut_type"
+    @assert burnin_iters >= 0 "burnin_iters must be non-negative"
+    SDDiPConfig(cut_type, lag_tol, lag_max_iter, step_size_init, step_decay,
+                burnin_iters, burnin_cut_type, level_cfg)
 end
+
+# Returns config with cut_type replaced by burnin_cut_type during burn-in.
+# level_cfg is always set to nothing during burn-in (burn-in uses :IO or :SB,
+# neither of which invokes the Lagrangian solver).
+_active_config(cfg::SDDiPConfig, iter::Int) =
+    (cfg.burnin_iters > 0 && iter <= cfg.burnin_iters &&
+     cfg.burnin_cut_type !== cfg.cut_type) ?
+    SDDiPConfig(cfg.burnin_cut_type, cfg.lag_tol, cfg.lag_max_iter,
+                cfg.step_size_init, cfg.step_decay, 0, cfg.burnin_cut_type, nothing) :
+    cfg
 
 # ============================================================================
 # Lagrangian helpers
@@ -189,6 +263,130 @@ function solve_lagrangian_dual!(
     return best_L, best_π
 end
 
+
+"""
+    solve_lagrangian_dual_level!(model, z_vars, x_parent, π_init, config) -> (best_L, best_π)
+
+Maximise the Lagrangian dual function
+
+    g(π) = L(π) + π'x_parent
+
+using the **level method** instead of plain subgradient ascent.
+
+Each iteration:
+1. **LP** – compute UB = max of the cutting-plane model over the box Λ = [-M,M]^d.
+2. **Convergence check** – stop if UB − LB ≤ lag_tol.
+3. **QP projection** – find the next iterate closest to the incumbent that lies above
+   the target level ℓ = α·LB + (1−α)·UB.
+4. **MIP subproblem** – evaluate g and its subgradient at the new π.
+
+Compared to subgradient ascent, the level method uses all past cuts, avoids
+step-size tuning, and converges in far fewer MIP solves (typically 10–40 vs 200+).
+
+Requires `config.level_cfg::LevelMethodConfig` to be set (carries the LP/QP optimizer
+factory, box half-width M, and level parameter α).
+
+Returns `(best_L, best_π)` — same interface as `solve_lagrangian_dual!`.
+"""
+function solve_lagrangian_dual_level!(
+    model   ::JuMP.Model,
+    z_vars  ::Vector{JuMP.VariableRef},
+    x_parent::Vector{Float64},
+    π_init  ::Vector{Float64},
+    config  ::SDDiPConfig,
+)
+    d    = length(z_vars)
+    lcfg = config.level_cfg      # LevelMethodConfig — guaranteed non-nothing by caller
+    M    = lcfg.box_M
+    α    = lcfg.alpha
+    tol  = config.lag_tol
+    opt  = lcfg.optimizer
+
+    # ── Seed: evaluate g at π_init ────────────────────────────────────────────
+    L_val, z_sol = _solve_lagrangian_subproblem!(model, z_vars, π_init, x_parent)
+    g_val  = L_val + dot(π_init, x_parent)
+    s      = x_parent .- z_sol
+
+    LB     = g_val
+    best_g = g_val
+    best_L = L_val
+    best_π = copy(π_init)
+
+    # Cut storage: each cut j defines the linearization
+    #   g(π) ≤ g_vals[j] + dot(sgrads[j], π − πpts[j])
+    # Equivalently, with intercept c_j = g_vals[j] − dot(sgrads[j], πpts[j]):
+    #   g(π) ≤ c_j + dot(sgrads[j], π)
+    c_cuts = Float64[g_val - dot(s, π_init)]   # intercepts
+    s_cuts = Vector{Float64}[copy(s)]           # subgradients (slopes)
+
+    # ── Build LP: max η  s.t.  η ≤ c_j + sⱼ'π,  π ∈ [-M,M]^d ───────────────
+    ub_model = JuMP.Model(opt)
+    JuMP.set_silent(ub_model)
+    @variable(ub_model, -M <= π_ub[1:d] <= M)
+    @variable(ub_model, η_ub)
+    @objective(ub_model, Max, η_ub)
+    @constraint(ub_model, η_ub <= c_cuts[1] + dot(s_cuts[1], π_ub))
+
+    # ── Build QP: min ½‖π−center‖²  s.t.  η≥ℓ,  η≤c_j+sⱼ'π,  π∈[-M,M]^d ──
+    qp_model = JuMP.Model(opt)
+    JuMP.set_silent(qp_model)
+    @variable(qp_model, -M <= π_qp[1:d] <= M)
+    @variable(qp_model, η_qp)
+    @objective(qp_model, Min, sum(π_qp[i]^2 for i in 1:d))   # placeholder; updated each iter
+    level_con = @constraint(qp_model, η_qp >= -1e10)          # RHS updated each iter
+    @constraint(qp_model, η_qp <= c_cuts[1] + dot(s_cuts[1], π_qp))
+
+    π_cur = copy(π_init)
+
+    for _ in 1:config.lag_max_iter
+
+        # ── Step 1: UB from cutting-plane LP ──────────────────────────────────
+        JuMP.optimize!(ub_model)
+        JuMP.termination_status(ub_model) == MOI.OPTIMAL || break
+        UB    = JuMP.objective_value(ub_model)
+        π_cur = JuMP.value.(π_ub)
+
+        # ── Step 2: Convergence check ──────────────────────────────────────────
+        UB - LB <= tol && break
+
+        # ── Step 3: Level and projection QP ───────────────────────────────────
+        ℓ = α * LB + (1 - α) * UB
+        JuMP.set_normalized_rhs(level_con, ℓ)
+
+        # Update QP objective: min ½‖π − best_π‖²  (use incumbent as center)
+        center = best_π
+        @objective(qp_model, Min,
+            0.5 * sum((π_qp[i] - center[i])^2 for i in 1:d))
+
+        JuMP.optimize!(qp_model)
+        if JuMP.termination_status(qp_model) == MOI.OPTIMAL
+            π_cur = JuMP.value.(π_qp)
+        end
+        # if QP is infeasible (level set ∩ Λ empty), π_cur stays as LP argmax
+
+        # ── Step 4: MIP subproblem at new π ───────────────────────────────────
+        L_val, z_sol = _solve_lagrangian_subproblem!(model, z_vars, π_cur, x_parent)
+        g_val = L_val + dot(π_cur, x_parent)
+        s     = x_parent .- z_sol
+
+        if g_val > best_g
+            best_g = g_val
+            best_L = L_val
+            best_π = copy(π_cur)
+        end
+        LB = max(LB, g_val)
+
+        # ── Step 5: Add new cut to both LP and QP ─────────────────────────────
+        c_new = g_val - dot(s, π_cur)
+        push!(c_cuts, c_new)
+        push!(s_cuts, copy(s))
+        @constraint(ub_model, η_ub <= c_new + dot(s, π_ub))
+        @constraint(qp_model, η_qp <= c_new + dot(s, π_qp))
+    end
+
+    return best_L, best_π
+end
+
 # ============================================================================
 # Integer Optimality (IO) cut coefficients
 # ============================================================================
@@ -250,8 +448,12 @@ function compute_sddip_cut!(
     π, lp_obj = _get_lp_dual(model, z_vars)
 
     if config.cut_type === :lagrangian
-        # Full Lagrangian dual via subgradient ascent
-        best_L, best_π = solve_lagrangian_dual!(model, z_vars, x_par, π, config)
+        # Full Lagrangian dual — level method or subgradient ascent
+        best_L, best_π = if isnothing(config.level_cfg)
+            solve_lagrangian_dual!(model, z_vars, x_par, π, config)
+        else
+            solve_lagrangian_dual_level!(model, z_vars, x_par, π, config)
+        end
         push!(result, (best_L, best_π))
 
     elseif config.cut_type === :SB || config.cut_type === :SB_IO
@@ -467,8 +669,9 @@ function run_sddip!(
     Random.seed!(rng, rand(UInt))
 
     for it in 1:max_iter
+        cfg_it = _active_config(config, it)
         fwd = forward_pass_online!(m; S = S, x0 = x0f, ctx0 = ctx0)
-        backward_pass_sddip!(m; fwd = fwd, config = config, iter = it,
+        backward_pass_sddip!(m; fwd = fwd, config = cfg_it, iter = it,
                              force_every = force_every, atol = cut_atol)
 
         cur_total = total_cuts()
@@ -480,11 +683,13 @@ function run_sddip!(
         prev_V    = cur_V
 
         stats = (iter = it, new_cuts = new_cuts, total_cuts = cur_total,
-                 V = cur_V, ΔV = ΔV, per_stage = cuts_by_stage())
+                 V = cur_V, ΔV = ΔV, per_stage = cuts_by_stage(),
+                 phase = it <= config.burnin_iters ? :burnin : :main)
         push!(hist, stats)
 
+        phase_tag = it <= config.burnin_iters ? "[SB burn-in] " : ""
         if logfn === nothing
-            @printf "iter %4d | new cuts: %2d | total: %3d | V%d(x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_index cur_V ΔV
+            @printf "iter %4d | %snew cuts: %2d | total: %3d | V%d(x0)=%.6f | ΔV=%.3e\n" it phase_tag new_cuts cur_total evaluate_index cur_V ΔV
         else
             logfn(it, stats)
         end
@@ -548,8 +753,9 @@ function run_markov_sddip!(
     Random.seed!(rng, rand(UInt))
 
     for it in 1:max_iter
+        cfg_it = _active_config(config, it)
         fwd = forward_pass_markov_online_old!(m; S = S, x0 = x0f, ctx0 = ctx0)
-        backward_pass_markov_sddip!(m; fwd = fwd, config = config, iter = it,
+        backward_pass_markov_sddip!(m; fwd = fwd, config = cfg_it, iter = it,
                                     force_every = force_every, atol = cut_atol)
 
         cur_total = total_cuts()
@@ -562,11 +768,13 @@ function run_markov_sddip!(
         prev_V    = cur_V
 
         stats = (iter = it, new_cuts = new_cuts, total_cuts = cur_total,
-                 V = cur_V, ΔV = ΔV, per_stage = cuts_by_stage())
+                 V = cur_V, ΔV = ΔV, per_stage = cuts_by_stage(),
+                 phase = it <= config.burnin_iters ? :burnin : :main)
         push!(hist, stats)
 
+        phase_tag = it <= config.burnin_iters ? "[SB burn-in] " : ""
         if logfn === nothing
-            @printf "iter %4d | new cuts: %2d | total: %3d | V%d[%s](x0)=%.6f | ΔV=%.3e\n" it new_cuts cur_total evaluate_stage string(evaluate_ctx) cur_V ΔV
+            @printf "iter %4d | %snew cuts: %2d | total: %3d | V%d[%s](x0)=%.6f | ΔV=%.3e\n" it phase_tag new_cuts cur_total evaluate_stage string(evaluate_ctx) cur_V ΔV
         else
             logfn(it, stats)
         end
