@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(julia --project=SDDPBAPE:*)",
+      "Bash(julia ddu_smoke_test.jl)"
+    ]
+  }
+}

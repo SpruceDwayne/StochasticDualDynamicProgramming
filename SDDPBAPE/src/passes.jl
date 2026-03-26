@@ -3,6 +3,158 @@ using JuMP
 using MathOptInterface
 const MOI = MathOptInterface
 
+# ============================================================================
+# Model Caching Functions
+# ============================================================================
+
+"""
+    get_or_build_model!(m, t, vf_next, ω, ctx, x_support)
+
+Retrieve cached model or build new one. Updates state fixing and epigraph incrementally.
+Returns: (model, x_state, θ, misc)
+"""
+function get_or_build_model!(m::Union{SDDP, MarkovSDDP},
+                             t::Int,
+                             vf_next::ValueFn{Float64},
+                             ω,
+                             ctx,
+                             x_support::AbstractVector{<:Real})
+    stg = m.stages[t]
+    # Include ω in the cache key so that scenario-specific subproblem models
+    # (whose constraints/objective depend on ω) are cached separately.
+    # When ω is nothing (no randomness at this stage), fall back to ctx alone.
+    cache_key = ω !== nothing ? (ctx, ω) : ctx
+
+    # Get or create cache entry
+    cache_dict = m.model_cache[t]
+    if !haskey(cache_dict, cache_key)
+        cache_dict[cache_key] = ModelCache{Float64}()
+    end
+    cache = cache_dict[cache_key]
+
+    # First time: build and prepare for caching
+    if cache.model === nothing
+        model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state = x_support)
+
+        # Determine which variables to fix: z_vars (SDDiP) or x_state (standard)
+        vars_to_fix = haskey(misc, :z_vars) ? misc[:z_vars] : x_state
+
+        # Convert constraint-based state fixing to fix()
+        find_and_remove_state_constraints!(model, vars_to_fix, x_support)
+        for i in 1:length(vars_to_fix)
+            JuMP.fix(vars_to_fix[i], x_support[i]; force=true)
+        end
+
+        # Store in cache
+        cache.model = model
+        cache.x_state = x_state
+        cache.x_next = haskey(misc, :x_next) ? misc[:x_next] : x_state
+        cache.z_vars = haskey(misc, :z_vars) ? misc[:z_vars] : nothing
+        cache.θ = θ
+        cache.misc = misc
+        cache.last_cut_count = length(vf_next.cuts)
+        cache.state_fixed = true
+
+        return model, x_state, θ, misc
+    end
+
+    # Subsequent times: update cached model
+    model = cache.model
+    x_state = cache.x_state
+    θ = cache.θ
+    misc = cache.misc
+
+    # Update state fixing values (z_vars for SDDiP, x_state for standard)
+    vars_to_fix = cache.z_vars !== nothing ? cache.z_vars : x_state
+    for i in 1:length(vars_to_fix)
+        JuMP.fix(vars_to_fix[i], x_support[i]; force=true)
+    end
+
+    # Add new epigraph cuts incrementally
+    n_current = length(vf_next.cuts)
+    if n_current > cache.last_cut_count
+        x_next = cache.x_next
+        for i in (cache.last_cut_count + 1):n_current
+            c = vf_next.cuts[i]
+            expr = c.α + sum(c.β[j] * x_next[j] for j in 1:length(x_next))
+            @constraint(model, θ >= expr)
+        end
+        cache.last_cut_count = n_current
+    end
+
+    return model, x_state, θ, misc
+end
+
+"""
+    find_and_remove_state_constraints!(model, x_state, x_support)
+
+Find and remove constraints of form x_state[i] == x_support[i].
+These will be replaced with fix() operations for better performance.
+"""
+function find_and_remove_state_constraints!(model::JuMP.Model,
+                                            x_state::Vector{JuMP.VariableRef},
+                                            x_support::AbstractVector{<:Real})
+    to_delete = JuMP.ConstraintRef[]
+
+    # Check all equality constraints
+    for (F, S) in JuMP.list_of_constraint_types(model)
+        if S == MOI.EqualTo{Float64}
+            for cref in JuMP.all_constraints(model, F, S)
+                con_obj = JuMP.constraint_object(cref)
+                # Check if this constraint fixes a state variable
+                if is_state_fixing_constraint(con_obj, x_state, x_support)
+                    push!(to_delete, cref)
+                end
+            end
+        end
+    end
+
+    # Delete identified constraints
+    for cref in to_delete
+        JuMP.delete(model, cref)
+    end
+
+    return nothing
+end
+
+"""
+    is_state_fixing_constraint(con_obj, x_state, x_support)
+
+Check if a constraint is of the form x_state[i] == x_support[i].
+"""
+function is_state_fixing_constraint(con_obj,
+                                   x_state::Vector{JuMP.VariableRef},
+                                   x_support::AbstractVector{<:Real})
+    func = con_obj.func
+
+    # Case 1: Simple variable equality (x == value)
+    if func isa JuMP.VariableRef
+        return func in x_state
+    end
+
+    # Case 2: Affine expression (a*x + b == value)
+    if func isa JuMP.AffExpr
+        terms = func.terms
+        # Check if it's a single variable with coefficient ±1
+        if length(terms) == 1
+            var, coeff = first(terms)
+            if var in x_state && abs(abs(coeff) - 1.0) < 1e-10
+                # Verify the constant matches expected value
+                i = findfirst(==(var), x_state)
+                if i !== nothing
+                    expected_constant = -x_support[i] * coeff
+                    return abs(func.constant - expected_constant) < 1e-10
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+# ============================================================================
+# Forward and Backward Pass Functions
+# ============================================================================
 
 "Forward pass artifacts."
 struct ForwardRecord
@@ -40,13 +192,15 @@ function forward_pass!(m::SDDP; trajectories::Vector{Trajectory}, x0::Vector{Flo
     for t in 1:T
         stg     = m.stages[t]
         ωt      = tr.ω[t]
-        vf_next = m.V[min(t+1, T)]
+        # At t=T there is no continuation; use an empty VF to avoid feeding
+        # accumulated V[T] cuts back into the terminal model's epigraph.
+        vf_next = t < T ? m.V[t + 1] : ValueFn{Float64}()
 
         # --- record PRE-decision state as the support point for stage t
         x_hist[s][t]   = copy(x)      # <- store x_t (not x_{t+1})
         ctx_hist[s][t] = ctx
 
-        model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state = x)  # anchor at x_t
+        model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ωt, ctx, x)  # anchor at x_t
         optimize!(model)
 
         # advance state
@@ -68,13 +222,15 @@ function forward_pass_online!(m::SDDP; S::Int, x0::Vector{Float64}, ctx0 = nothi
     for t in 1:T
         stg     = m.stages[t]
         ωt      = stg.sampler()
-        vf_next = m.V[min(t+1, T)]
+        # At t=T there is no continuation; use an empty VF to avoid feeding
+        # accumulated V[T] cuts back into the terminal model's epigraph.
+        vf_next = t < T ? m.V[t + 1] : ValueFn{Float64}()
 
         # --- record PRE-decision support point
         x_hist[s][t]   = copy(x)
         ctx_hist[s][t] = ctx
 
-        model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state = x)  # anchor at x_t
+        model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ωt, ctx, x)  # anchor at x_t
         optimize!(model)
 
         x   = haskey(misc, :x_next) ? value.(misc[:x_next]) : value.(x_state)
@@ -285,7 +441,7 @@ function backward_pass_expected!(m::SDDP; fwd::ForwardRecord, iter::Int=1,
             β_acc = zeros(stg.state_dim)
 
             for (ω, pω) in zip(Ωs, ps)
-                model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state = x_support)
+                model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ω, ctx, x_support)
                 optimize!(model)
                 misc[:x_state] = get(misc, :x_state, x_state)
 
@@ -333,7 +489,7 @@ function forward_pass_markov_online_old!(m::MarkovSDDP;
             x_hist[s][t]   = copy(x)
             ctx_hist[s][t] = ctx
 
-            model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state=x)
+            model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ωt, ctx, x)
             optimize!(model)
 
             x   = haskey(misc, :x_next) ? value.(misc[:x_next]) : value.(x_state)
@@ -398,7 +554,7 @@ function forward_pass_markov_online!(m::MarkovSDDP;
             ωt = stg.sampler(ctx)
             vf_next = (t < T) ? get_V!(m, t+1, ctx) : vf_terminal
 
-            model, x_state, θ, misc = stg.build(t, vf_next, ωt; fix_state=x)
+            model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ωt, ctx, x)
             optimize!(model)
 
             # update x_next without allocating
@@ -460,7 +616,7 @@ function backward_pass_markov_expected!(m::MarkovSDDP;
                     ValueFn{Float64}()        # no continuation at final stage
                 end
 
-                model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state=x_support)
+                model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ω, ctx, x_support)
                 optimize!(model)
                 misc[:x_state] = get(misc, :x_state, x_state)
 
@@ -612,7 +768,7 @@ function backward_pass_markov_rho!(m::MarkovSDDP;
                     ctx_next = stg.next_ctx(t, ctx, ω)
                     vf_next = (t < T) ? get_V!(m, t+1, ctx_next) : vf_terminal
 
-                    model, x_state, θ, misc = stg.build(t, vf_next, ω; fix_state = x_support)
+                    model, x_state, θ, misc = get_or_build_model!(m, t, vf_next, ω, ctx, x_support)
                     optimize!(model)
                     misc[:x_state] = get(misc, :x_state, x_state)
 
