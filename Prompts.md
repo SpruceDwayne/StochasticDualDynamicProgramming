@@ -139,7 +139,7 @@ Save the table as a CSV and the plot as a PNG.
 ```
 Generate publication-quality output for the lecture notes:
 
-1. A convergence plot (PDF or PNG, 300 dpi) showing DDU-SDDP vs standard SDDiP
+1. A convergence plot (PDF or PNG, 300 dpi) showing DDU-SDDP vs  standard SDDiP
    lower bounds over iterations.
 
 2. A table (LaTeX format) with columns:
