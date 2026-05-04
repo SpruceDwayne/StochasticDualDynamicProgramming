@@ -205,6 +205,14 @@ Fields:
                extensive-form solution (solve_extensive_control or manual LP).
                If the DDU value is strictly higher than the LP optimum,
                M_big is likely too small.
+- `use_indicators` : if `true`, use solver-native indicator constraints instead
+               of big-M linearisation:
+                 𝟙_d = 1  →  θ ≥ α + β' x_next
+               Requires a solver that supports `MOI.Indicator` (Gurobi, CPLEX).
+               When `true`, `M_big` is ignored and does not need to be set.
+               Advantages over big-M: no parameter to size, no silent suboptimality
+               risk, better numerical conditioning for large instances.
+               Default: `false` (backward-compatible big-M behaviour).
 - `regions`  : regions[t] = Vector{DDURegion} listing all d ∈ D_t
 - `model_cache` : model_cache[t][ω] = DDUModelCache, keyed by scenario ω
 """
@@ -214,17 +222,19 @@ mutable struct DDUSDDP
     T::Int
     γ::Float64
     M_big::Float64
+    use_indicators::Bool
     regions::Vector{Vector{DDURegion}}
     model_cache::Vector{Dict{Any, DDUModelCache{Float64}}}
 end
 
 function DDUSDDP(stages::Vector{Stage}, regions::Vector{Vector{DDURegion}};
-                 discount::Float64 = 1.0, M_big::Float64 = 1e6)
+                 discount::Float64 = 1.0, M_big::Float64 = 1e6,
+                 use_indicators::Bool = false)
     T = length(stages)
     @assert length(regions) == T "regions must have one entry per stage"
     V     = [Dict{Int, ValueFn{Float64}}() for _ in 1:T]
     cache = [Dict{Any, DDUModelCache{Float64}}() for _ in 1:T]
-    DDUSDDP(stages, V, T, discount, M_big, regions, cache)
+    DDUSDDP(stages, V, T, discount, M_big, use_indicators, regions, cache)
 end
 
 """
@@ -322,8 +332,10 @@ is used and which cuts have been added.
 function get_or_build_ddu_model!(m::DDUSDDP, t::Int, ω, x_support::AbstractVector{<:Real})
     stg = m.stages[t]
 
-    # Cache key: ω (scenario determines model RHS; context ζ does not)
-    cache_key = ω
+    # Normalise cache key to Vector{Float64} so that scenarios stored as
+    # Vector{Int} during training and Vector{Float64} during simulation map to
+    # the same cache entry and share their accumulated big-M cuts.
+    cache_key  = ω isa AbstractVector ? collect(Float64, ω) : ω
     cache_dict = m.model_cache[t]
     if !haskey(cache_dict, cache_key)
         cache_dict[cache_key] = DDUModelCache{Float64}()
@@ -357,15 +369,16 @@ function get_or_build_ddu_model!(m::DDUSDDP, t::Int, ω, x_support::AbstractVect
         cache.misc              = misc
         cache.state_fixed       = true
 
-        # Initialise per-region cut counters to 0
+        # Initialise per-region cut counters to 0 — fall through to apply any
+        # cuts that already exist in m.V[t] (e.g. when simulation reuses a
+        # trained model via a new cache key after type normalisation).
         for d in m.regions[t]
             cache.last_cut_count_by_region[d.id] = 0
         end
-
-        return model, x_state, θ, misc
+        # intentional fall-through — do NOT return here
     end
 
-    # ── Subsequent calls: update ─────────────────────────────────────────────
+    # ── Every call (including the first): re-fix state and apply new cuts ────
     model             = cache.model
     x_state           = cache.x_state
     θ                 = cache.θ
@@ -395,10 +408,16 @@ function get_or_build_ddu_model!(m::DDUSDDP, t::Int, ω, x_support::AbstractVect
             ind_var = region_indicators[d_id]
             for i in (last + 1):n_current
                 c = vf.cuts[i]
-                # Big-M cut: active (tight) when 𝟙_d = 1, relaxed by M when 𝟙_d = 0
-                @constraint(model,
-                    θ >= c.α + sum(c.β[j] * x_next[j] for j in 1:n_next) +
-                         m.M_big * (ind_var - 1))
+                if m.use_indicators
+                    # Indicator form: solver handles activation natively (Gurobi/CPLEX)
+                    @constraint(model,
+                        ind_var => {θ >= c.α + sum(c.β[j] * x_next[j] for j in 1:n_next)})
+                else
+                    # Big-M form: active (tight) when 𝟙_d = 1, relaxed by M when 𝟙_d = 0
+                    @constraint(model,
+                        θ >= c.α + sum(c.β[j] * x_next[j] for j in 1:n_next) +
+                             m.M_big * (ind_var - 1))
+                end
             end
             cache.last_cut_count_by_region[d_id] = n_current
         end

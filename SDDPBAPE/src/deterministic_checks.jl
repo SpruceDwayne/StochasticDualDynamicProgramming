@@ -1,4 +1,4 @@
-using JuMP, HiGHS
+using JuMP
 import MathOptInterface as MOI
 
 """
@@ -59,6 +59,9 @@ sum of stage costs. The model enforces nonanticipativity by having one decision 
     Return `(nothing, nothing)` when not applicable.
 - `ctx0` (optional):
     Initial node context. Defaults to `nothing`.
+- `optimizer` (optional):
+    JuMP-compatible solver factory. Defaults to `HiGHS.Optimizer`. Pass any
+    MOI-compatible optimizer, e.g. `Gurobi.Optimizer`.
 
 # Returns
 - `x0_star::Vector{Float64}`: Optimal here-and-now control `u0` (respects `ucap0`).
@@ -87,11 +90,19 @@ x0, obj, ef = solve_extensive_control(m;
     # stage_cost, dynamics left as defaults
 )
 println("x0* = ", x0[1], ", obj = ", obj)
+```
+
+Using Gurobi instead of HiGHS:
+```julia
+using Gurobi
+x0, obj, ef = solve_extensive_control(m;
+    B0        = [100.0],
+    c0        = [1.06],
+    optimizer = Gurobi.Optimizer,
+)
+```
 """
 # ===================== General deterministic-equivalent solver =====================
-using JuMP, HiGHS
-import MathOptInterface as MOI
-
 function solve_extensive_control(m::SDDP;
     B0::AbstractVector,
     c0::AbstractVector,
@@ -104,6 +115,7 @@ function solve_extensive_control(m::SDDP;
     Aeq_beq::Union{Nothing,Function}=nothing,     # (t,ω) -> (Aeq, beq) or (nothing, nothing)
     Ale_ble::Union{Nothing,Function}=nothing,     # (t,ω) -> (Ale, ble) or (nothing, nothing)
     ctx0 = nothing,
+    optimizer = HiGHS.Optimizer,
 )
     T = m.T
     n = length(B0)
@@ -145,7 +157,7 @@ function solve_extensive_control(m::SDDP;
     to_vec(v, dim) = (v isa AbstractVector ? collect(Float64.(v)) :
                       isfinite(v) ? fill(Float64(v), dim) : fill(Inf, dim))
 
-    model = Model(HiGHS.Optimizer); set_silent(model)
+    model = Model(optimizer); set_silent(model)
     @variable(model, B[1:N, 1:n])
     @variable(model, u[1:N, 1:n] >= 0)
 

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(julia --project=SDDPBAPE:*)",
-      "Bash(julia ddu_smoke_test.jl)"
+      "Bash(julia ddu_smoke_test.jl)",
+      "Bash(python make_tables_and_plots.py)"
     ]
   }
 }

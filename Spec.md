@@ -8,9 +8,9 @@ This is a specification for implementing a **multistage facility location proble
 
 ## Problem overview
 
-A firm decides which facilities to open over T stages. Opening facilities affects future customer demand (decision-dependent uncertainty). The firm earns revenue by serving demand, pays fixed costs to open new facilities, and wants to maximize total expected profit.
+A firm decides which facilities to open over T=4 stages. Opening facilities affects future customer demand (decision-dependent uncertainty). The firm earns revenue by serving demand, pays fixed costs to open new facilities, and wants to maximize total expected profit.
 
-The key DDU mechanism: facilities are grouped into **zones**. Which zones are "active" (have ≥1 open facility) determines the probability distribution of next-stage demand. Additionally, a **habit state** b_z ∈ {0,1} per zone tracks whether a customer base has ever been established there; once set, it persists.
+The key DDU mechanism: facilities are grouped into **zones**. Which zones are "active" (have ≥1 open facility) determines the probability distribution of next-stage demand. A per-stage budget constraint limits the firm to opening at most k=2 new facilities per stage, creating a nontrivial sequencing problem: the firm must decide which facilities to open first, knowing that early openings shift demand distributions for all subsequent stages.
 
 ---
 
@@ -22,7 +22,7 @@ The key DDU mechanism: facilities are grouped into **zones**. Which zones are "a
 | J | Customers | 15 (indexed 1:15) |
 | Z | Zones | 3 (indexed 1:3) |
 | D | Regions (activation patterns) | 8 (powerset of Z, indexed 1:8) |
-| T | Stages | User-specified (e.g. 4) |
+| T | Stages | 4 |
 
 ### Facility-to-zone mapping
 
@@ -55,8 +55,10 @@ The key DDU mechanism: facilities are grouped into **zones**. Which zones are "a
 | C | 15 | Capacity per facility (uniform) |
 | O | 500 | Fixed cost of opening a facility (uniform) |
 | c | 2 | Transportation cost per unit Euclidean distance |
+| k | 2 | Maximum number of new facility openings per stage |
 | n | 10 | Maximum demand per customer (BetaBinomial support: {0,...,10}) |
 | s | 6 | BetaBinomial scale parameter |
+| T | 4 | Number of stages |
 
 ### Profit matrix
 
@@ -70,14 +72,15 @@ where `dist(i,j)` is the Euclidean distance between facility i and customer j. A
 
 ## State variables
 
-The full state entering stage t is `(x_{t-1}, b_{t-1})`:
+The state entering stage t is:
 
 - **x_{t-1} ∈ {0,1}^8**: which facilities are currently open
-- **b_{t-1} ∈ {0,1}^3**: which zones have established customer habits
 
-Total state dimension: 11 binary variables.
+Total state dimension: 8 binary variables.
 
-Initial state: `x_0 = 0, b_0 = 0` (nothing open, no habits).
+Initial state: `x_0 = 0` (no facilities open).
+
+Since facilities once opened stay open (`x[i,t] ≥ x[i,t-1]`), the state is monotonically nondecreasing. The zone activation pattern — and hence the active region — is fully determined by `x_t`.
 
 ---
 
@@ -89,7 +92,6 @@ Initial state: `x_0 = 0, b_0 = 0` (nothing open, no habits).
 |----------|------|-----------|-------------|
 | x_t | Binary | 8 | Facility configuration after stage t |
 | w_{ij} | Continuous ≥ 0 | 8 × 15 | Demand from customer j served by facility i |
-| b_t | Binary | 3 | Habit state after stage t |
 | a_z | Binary | 3 | Zone activation indicator (auxiliary) |
 | δ_d | Binary | 8 | Region indicator |
 | θ | Continuous | 1 | Cost-to-go approximation variable |
@@ -118,6 +120,11 @@ w[i,j] ≥ 0                        ∀ i,j
 x[i,t] ≥ x[i,t-1]                 ∀ i ∈ I
 ```
 
+**Per-stage opening budget:**
+```
+Σ_i (x[i,t] - x[i,t-1]) ≤ k      (at most k=2 new openings per stage)
+```
+
 **Zone activation:**
 ```
 a[z] ≤ Σ_{i ∈ I_z} x[i,t]         ∀ z ∈ Z     (if no facility open, zone inactive)
@@ -127,27 +134,15 @@ a[z] ∈ {0,1}
 
 Equivalently: `a[z] = 1 iff Σ_{i ∈ I_z} x[i,t] ≥ 1`.
 
-**Habit state evolution (linearized max):**
-```
-b[z,t] ≥ b[z,t-1]                  ∀ z ∈ Z     (habits persist)
-b[z,t] ≥ a[z]                      ∀ z ∈ Z     (new activation creates habit)
-b[z,t] ≤ b[z,t-1] + a[z]           ∀ z ∈ Z     (tight: equals max)
-b[z,t] ∈ {0,1}
-```
-
 **Region activation:**
 
-Each region d corresponds to a specific subset S_d ⊆ Z of active zones. The constraint `δ[d] = 1 iff (a[z] = 1 ∀ z ∈ S_d) and (a[z] = 0 ∀ z ∉ S_d)` can be linearized as:
+Each region d corresponds to a specific subset S_d ⊆ Z of active zones. The region indicator δ is linked to a:
 
 ```
 Σ_d δ[d] = 1                                    (exactly one region active)
 δ[d] ∈ {0,1}                                    ∀ d ∈ D
 
 # Linking δ to a:
-# For each region d with active zone set S_d:
-#   if δ[d] = 1, then a[z] = 1 for z ∈ S_d and a[z] = 0 for z ∉ S_d
-#
-# This is enforced by:
 a[z] = Σ_{d : z ∈ S_d} δ[d]                     ∀ z ∈ Z
 ```
 
@@ -168,15 +163,11 @@ At stage T, set `θ = 0` (no future cost). The subproblem is just the demand-ser
 
 ## DDU mapping: how to compute demand distributions
 
-Given a state-decision pair `(x_t, b_t)` at stage t, the next-stage demand is sampled as follows.
+Given a facility configuration `x_t` at stage t, the next-stage demand distribution is fully determined by the zone activation pattern `a(x_t)`.
 
-### Step 1: Determine effective zone activation
+### Step 1: Identify the active region
 
-```
-zone_active[z] = max(a[z], b[z,t])    ∀ z
-```
-
-where `a[z] = 1{Σ_{i ∈ I_z} x[i,t] ≥ 1}`.
+Compute `a[z] = 1{Σ_{i ∈ I_z} x[i,t] ≥ 1}` for each zone. The region d is the unique index such that `S_d = {z : a[z] = 1}`.
 
 ### Step 2: Compute demand distribution per customer
 
@@ -190,7 +181,7 @@ For each customer j:
    mean[j] = base_mean[j]
    for k = 1, 2, 3:
        z = zone_order[j][k]
-       if zone_active[z] == 1:
+       if a[z] == 1:
            mean[j] += (0.5^k) * base_mean[j]
    mean[j] = min(mean[j], 10 - 1e-6)
    ```
@@ -204,11 +195,25 @@ For each customer j:
 
 4. The demand `ξ[j]` is drawn from `BetaBinomial(10, â, b̂)` with support `{0, 1, ..., 10}`.
 
-### Step 3: Discretize for the solver
+### SAA discretization
 
-The solver needs a finite set of scenarios with probabilities for each region d. Precompute the full PMF vectors (length 11 each) for all 15 customers, for each of the 8 regions. Customer demands are independent conditional on the region, so a scenario is a vector in `{0,...,10}^15`.
+The full joint support of customer demands has 11^15 elements per region, which is intractable. We use a **Sample Average Approximation (SAA)**: before running the algorithm, draw a fixed set of N scenarios for each region and treat them as the true finite support throughout all iterations.
 
-**Important:** for tractability, you will likely want to sample a moderate number of scenarios per region rather than enumerate all `11^15` possibilities. A reasonable approach: for each region, draw N_samples scenarios from the joint distribution (product of independent BetaBinomials) and assign equal probability 1/N_samples to each.
+**Setup (done once before the algorithm starts):**
+For each region d ∈ {1,...,8}:
+1. Compute the per-customer BetaBinomial PMFs for region d (as above).
+2. Draw N i.i.d. demand vectors ξ^{d,1}, ..., ξ^{d,N} ∈ {0,...,10}^15 by sampling each customer independently from their PMF.
+3. Assign equal probability 1/N to each scenario.
+
+Store these as a 3D array: `scenarios[d][n, j]` = demand of customer j in scenario n of region d. Shape: 8 regions × N scenarios × 15 customers.
+
+**Forward pass:** At each stage, once the active region d is identified, sample uniformly from {ξ^{d,1}, ..., ξ^{d,N}} to obtain the next-stage realization.
+
+**Backward pass:** To compute the cut coefficients for region d, solve the stage-(t+1) subproblem for every scenario ξ^{d,1}, ..., ξ^{d,N} and average the results. This expectation is exact over the SAA support.
+
+**Key property:** The scenario sets are fixed across all iterations. This ensures that the lower bound is monotonically nondecreasing and the finite convergence result (Proposition 5.2) applies directly.
+
+A reasonable starting value is N = 50 scenarios per region.
 
 ---
 
@@ -223,6 +228,8 @@ All instance data is in `instance_data.json`. Key fields:
 | `num_zones` | Int | 3 |
 | `max_demand` | Int | 10 |
 | `R`, `C`, `O` | Int | 400, 15, 500 |
+| `k` | Int | 2 |
+| `T` | Int | 4 |
 | `customer_coords` | Matrix 15×2 | Customer (x,y) positions |
 | `customer_base_alpha` | Vector 15 | α_j parameters |
 | `customer_base_beta` | Vector 15 | β_j parameters |
@@ -242,17 +249,17 @@ All instance data is in `instance_data.json`. Key fields:
 
 You need to provide the solver with:
 
-1. **Instance data struct** containing all parameters, sets, and precomputed data.
+1. **Instance data struct** containing all parameters, sets, and precomputed data (including the fixed SAA scenarios).
 
 2. **A function that builds the stage-t subproblem** as a JuMP model, given:
    - Stage index t
-   - Incoming state (x_{t-1}, b_{t-1})
+   - Incoming state x_{t-1}
    - Uncertainty realization ξ_t
    - Current cut collection for each region
 
-3. **A function that returns demand distributions** (scenario set + probabilities) for a given region d. This is called during the forward pass to sample next-stage uncertainty.
+3. **The fixed SAA scenario sets** for each region d, used by both the forward pass (sample from) and backward pass (iterate over).
 
-4. **Region identification function**: given a solution (x_t, b_t), return which region d is active.
+4. **Region identification function**: given a solution x_t, return which region d is active.
 
 Consult the solver's existing interface/API and match these to whatever types and function signatures it expects.
 
@@ -263,7 +270,7 @@ Consult the solver's existing interface/API and match these to whatever types an
 ```
 facility_location/
 ├── instance_data.json          # Generated instance (already exists)
-├── problem_src/
+├── src/
 │   ├── FacilityLocation.jl     # Module file
 │   ├── data.jl                 # Load and parse instance_data.json
 │   ├── distributions.jl        # DDU mapping: region → demand distributions
@@ -283,11 +290,12 @@ Before running the full DDU-SDDP, verify:
 
 - [ ] Profit matrix matches Python output (range ≈ 183–394)
 - [ ] Zone assignments match (zone 1: facs {1,2,6,7,8}, zone 2: {4,5}, zone 3: {3})
-- [ ] For x = zeros(8), b = zeros(3): customer 1 mean demand = 1.5, customer 15 mean = 8.5
-- [ ] For x = ones(8), b = ones(3): customer 8 mean demand ≈ 9.38
+- [ ] For x = zeros(8) (no zones active, region 1): customer 1 mean demand = 1.5, customer 15 mean = 8.5
+- [ ] For x = ones(8) (all zones active, region 8): customer 8 mean demand ≈ 9.38
 - [ ] Region activation: x = [1,0,0,0,0,0,0,0] (only fac 1 open → zone 1 active) → region 2
 - [ ] Single-stage subproblem solves and returns sensible profit
 - [ ] Opening cost is only charged for *newly* opened facilities
+- [ ] Budget constraint: with x_prev=zeros, at most 2 facilities are opened
 
 ---
 

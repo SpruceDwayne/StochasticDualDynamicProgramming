@@ -132,18 +132,22 @@ function is_state_fixing_constraint(con_obj,
         return func in x_state
     end
 
-    # Case 2: Affine expression (a*x + b == value)
+    # Case 2: Affine expression (a*x + b == rhs)
+    # JuMP stores @constraint(model, z[i] == v) as:
+    #   func = 1.0*z[i] + 0.0  in  MOI.EqualTo(v)
+    # so the RHS lives in con_obj.set.value, NOT in func.constant.
     if func isa JuMP.AffExpr
         terms = func.terms
         # Check if it's a single variable with coefficient ±1
         if length(terms) == 1
             var, coeff = first(terms)
             if var in x_state && abs(abs(coeff) - 1.0) < 1e-10
-                # Verify the constant matches expected value
                 i = findfirst(==(var), x_state)
                 if i !== nothing
-                    expected_constant = -x_support[i] * coeff
-                    return abs(func.constant - expected_constant) < 1e-10
+                    # Actual fixed value: (set_rhs - func_constant) / coeff
+                    set_rhs = con_obj.set.value
+                    actual_value = (set_rhs - func.constant) / coeff
+                    return abs(actual_value - x_support[i]) < 1e-10
                 end
             end
         end

@@ -1,0 +1,21 @@
+{
+  "T": 3,
+  "k": 3,
+  "M_BIG": 90000.0,
+  "nI": 12,
+  "n_regions": 2,
+  "nZ": 1,
+  "converged": false,
+  "total_iters": 100,
+  "std_iter_time_s": 0.6106287849208952,
+  "final_lb": -11642.725993804244,
+  "setup_time_s": 0.0,
+  "stop_reason": "max_iter",
+  "tag": "exp3_Z1_N25",
+  "inst_path": "C:\\Users\\basti\\Documents\\Thesis\\code\\StochasticDualDynamicProgramming\\facility_location\\complexity_study\\instances\\exp3_Z1.json",
+  "total_time_s": 85.85500001907349,
+  "N_SAA": 25,
+  "nJ": 6,
+  "seed": 123,
+  "mean_iter_time_s": 0.8585500001907349
+}

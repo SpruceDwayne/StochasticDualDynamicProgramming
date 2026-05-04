@@ -14,13 +14,18 @@ Configuration for the level-method Lagrangian dual solver.
 Fields:
 - `alpha`     – level parameter α ∈ (0,1); target level = α·LB + (1-α)·UB (default 0.5)
 - `box_M`     – half-width of box constraint on dual variables: π ∈ [-M,M]^d (default 1e3)
-- `optimizer` – LP/QP solver factory (e.g. `HiGHS.Optimizer`); must support quadratic objectives
+- `optimizer` – LP/QP solver factory; must support quadratic objectives.
+    Pass any MOI-compatible optimizer, e.g. `HiGHS.Optimizer` or `Gurobi.Optimizer`.
 
 Example:
 ```julia
 using HiGHS
 LevelMethodConfig(optimizer = HiGHS.Optimizer)
 LevelMethodConfig(alpha = 0.3, box_M = 500.0, optimizer = HiGHS.Optimizer)
+
+# With Gurobi:
+using Gurobi
+LevelMethodConfig(optimizer = Gurobi.Optimizer)
 ```
 """
 struct LevelMethodConfig
@@ -74,6 +79,10 @@ Example — switching to the level method:
 ```julia
 using HiGHS
 SDDiPConfig(cut_type = :lagrangian, level_cfg = LevelMethodConfig(optimizer = HiGHS.Optimizer))
+
+# With Gurobi:
+using Gurobi
+SDDiPConfig(cut_type = :lagrangian, level_cfg = LevelMethodConfig(optimizer = Gurobi.Optimizer))
 ```
 """
 struct SDDiPConfig
@@ -145,16 +154,26 @@ function _get_lp_dual(model::JuMP.Model, z_vars::Vector{JuMP.VariableRef})
         )
     end
 
+    # Force simplex BEFORE relaxing integrality. Setting solver attributes after
+    # a model modification resets JuMP's CachingOptimizer solution cache, which
+    # makes termination_status return OPTIMIZE_NOT_CALLED even after optimize!.
+    # Simplex (Method=1) is required because barrier without crossover produces
+    # an interior-point solution with no basis, so has_duals returns false.
+    # Wrapped in try-catch: a no-op for solvers that don't support "Method" (e.g. HiGHS).
+    try; JuMP.set_optimizer_attribute(model, "Method", 1); catch; end   # 1 = dual simplex
+
     undo = JuMP.relax_integrality(model)
     JuMP.optimize!(model)
 
     status = JuMP.termination_status(model)
     if status != MOI.OPTIMAL
         undo()
+        try; JuMP.set_optimizer_attribute(model, "Method", -1); catch; end
         error("SDDiP: LP relaxation terminated with status $status (expected OPTIMAL)")
     end
     if !JuMP.has_duals(model)
         undo()
+        try; JuMP.set_optimizer_attribute(model, "Method", -1); catch; end
         error("SDDiP: LP solver did not return dual values; check solver settings")
     end
 
@@ -162,6 +181,10 @@ function _get_lp_dual(model::JuMP.Model, z_vars::Vector{JuMP.VariableRef})
     π = [JuMP.dual(JuMP.FixRef(z_vars[i])) for i in 1:d]
 
     undo()
+    # Restore automatic method selection for subsequent MIP solves on this
+    # cached model. Safe to do after undo() since the model modification already
+    # reset the solution cache.
+    try; JuMP.set_optimizer_attribute(model, "Method", -1); catch; end
     return π, lp_obj
 end
 
@@ -187,7 +210,12 @@ function _solve_lagrangian_subproblem!(
     π::Vector{Float64},
     x_parent::Vector{Float64},
 )
-    d = length(z_vars)
+    d   = length(z_vars)
+    obj = JuMP.objective_function(model)
+
+    # Save existing objective coefficients of z_vars before any modification.
+    # set_objective_coefficient replaces (not adds), so we must restore manually.
+    z_obj_orig = [JuMP.coefficient(obj, z_vars[i]) for i in 1:d]
 
     # Unfix z_vars and restore bounds
     for i in 1:d
@@ -196,18 +224,18 @@ function _solve_lagrangian_subproblem!(
         JuMP.set_upper_bound(z_vars[i], 1.0)
     end
 
-    # Add –π'z to the objective
+    # Add –π'z to the objective by setting coefficient to (original + (–π[i]))
     for i in 1:d
-        JuMP.set_objective_coefficient(model, z_vars[i], -π[i])
+        JuMP.set_objective_coefficient(model, z_vars[i], z_obj_orig[i] - π[i])
     end
 
     JuMP.optimize!(model)
     L_val  = JuMP.objective_value(model)
     z_sol  = JuMP.value.(z_vars)
 
-    # Restore: zero out z objective coefficients and re-fix to x_parent
+    # Restore: original z objective coefficients and re-fix to x_parent
     for i in 1:d
-        JuMP.set_objective_coefficient(model, z_vars[i], 0.0)
+        JuMP.set_objective_coefficient(model, z_vars[i], z_obj_orig[i])
         JuMP.fix(z_vars[i], x_parent[i]; force = true)
     end
 

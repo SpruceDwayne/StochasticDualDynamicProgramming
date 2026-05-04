@@ -1,0 +1,27 @@
+\begin{table}[ht]
+\centering
+\caption{Out-of-sample performance comparison, $k_{\max}=1$. Mean profit and standard deviation (Std) over 1{,}000 simulation paths, evaluated under the true BetaBinomial distribution (True) and the SAA scenario set (SAA). Gap\% $= 100\times(\bar\pi_{\text{DDU}} - \bar\pi_{\text{STD}})/|\bar\pi_{\text{STD}}|$.}
+\label{tab:perf_k1}
+\small
+\begin{tabular}{ll rr rr rr rr rr}
+\toprule
+ & & \multicolumn{4}{c}{DDU-SDDiP} & \multicolumn{4}{c}{SDDiP} & \multicolumn{2}{c}{Gap (\%)} \\
+\cmidrule(lr){3-6}\cmidrule(lr){7-10}\cmidrule(lr){11-12}
+Type & $N$ & \multicolumn{2}{c}{True} & \multicolumn{2}{c}{SAA} & \multicolumn{2}{c}{True} & \multicolumn{2}{c}{SAA} & True & SAA \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}
+& & Mean & Std & Mean & Std & Mean & Std & Mean & Std & & \\
+\midrule
+A & 25 & 70,483 & 1 & 70,483  & 1 & 59,484 & 1 & 59,485  & 1 & +18.5 & +18.5 \\
+ & 50 & 70,483 & 1 & 70,483  & 1 & 59,484 & 1 & 59,484  & 1 & +18.5 & +18.5 \\
+\midrule
+B & 25 & 69,372 & 1,900 & 69,755  & 1,142 & 59,465 & 187 & 59,481  & 1 & +16.7 & +17.3 \\
+ & 50 & 69,359 & 1,908 & 69,527  & 1,539 & 59,465 & 187 & 59,481  & 2 & +16.6 & +16.9 \\
+\midrule
+C & 25 & 69,802 & 1,423 & 70,314  & 575 & 59,482 & 1 & 59,482  & 1 & +17.3 & +18.2 \\
+ & 50 & 70,017 & 1,258 & 70,191  & 1,118 & 59,482 & 1 & 59,483  & 1 & +17.7 & +18.0 \\
+\midrule
+D & 25 & 57,953 & 2,210 & 58,255  & 1,485 & 54,274 & 3,886 & 56,087  & 3,226 & +6.8 & +3.9 \\
+ & 50 & 57,756 & 2,249 & 58,008  & 1,919 & 54,274 & 3,886 & 53,396  & 4,405 & +6.4 & +8.6 \\
+\bottomrule
+\end{tabular}
+\end{table}

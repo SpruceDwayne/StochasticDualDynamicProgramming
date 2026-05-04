@@ -2,6 +2,7 @@ module SDDPBAPE
 
 using JuMP
 using LinearAlgebra
+using HiGHS
 # If your ω types use SparseMatrixCSC, also:
 # using SparseArrays
 
